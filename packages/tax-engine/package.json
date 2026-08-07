@@ -1,0 +1,14 @@
+{
+  "name": "@vera/tax-engine",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "vitest run",
+    "lint": "tsc -p tsconfig.json --noEmit"
+  },
+  "dependencies": { "decimal.js": "^10.6.0" },
+  "devDependencies": { "typescript": "^5.9.2", "vitest": "^3.2.4" }
+}
