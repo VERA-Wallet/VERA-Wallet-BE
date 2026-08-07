@@ -1,0 +1,112 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String                 @id @default(uuid())
+  didHash       String                 @unique
+  createdAt     DateTime               @default(now())
+  verifications IdentityVerification[]
+  bindings      WalletBinding[]
+  reports       TaxReport[]
+}
+
+model IdentityVerification {
+  id         String                @id @default(uuid())
+  userId     String
+  user       User                  @relation(fields: [userId], references: [id])
+  method     String
+  verifiedAt DateTime
+  credential VerifiableCredential?
+}
+
+model VerifiableCredential {
+  id             String               @id @default(uuid())
+  verificationId String               @unique
+  verification   IdentityVerification @relation(fields: [verificationId], references: [id])
+  vcType         String
+  status         String
+  payload        Json
+}
+
+model WalletBinding {
+  id            String                  @id @default(uuid())
+  userId        String
+  user          User                    @relation(fields: [userId], references: [id])
+  walletAddress String
+  bindingHash   String                  @unique
+  boundAt       DateTime                @default(now())
+  transactions  TransactionNormalized[]
+
+  @@unique([userId, walletAddress])
+  @@index([walletAddress])
+}
+
+model TransactionRaw {
+  id        String   @id @default(uuid())
+  source    String
+  payload   Json
+  fetchedAt DateTime @default(now())
+}
+
+model TransactionNormalized {
+  id         String        @id @default(uuid())
+  bindingId  String
+  binding    WalletBinding @relation(fields: [bindingId], references: [id])
+  txHash     String
+  eventType  String
+  chain      String
+  payload    Json
+  occurredAt DateTime
+  taxEvents  TaxEvent[]
+
+  @@unique([bindingId, txHash, eventType])
+  @@index([bindingId, occurredAt])
+}
+
+model TaxEvent {
+  id          String                @id @default(uuid())
+  txId        String
+  tx          TransactionNormalized @relation(fields: [txId], references: [id])
+  reportId    String?
+  report      TaxReport?            @relation(fields: [reportId], references: [id])
+  countryCode String
+  ruleVersion String
+  gainLoss    Decimal
+  isEstimate  Boolean               @default(true)
+
+  @@index([reportId])
+  @@index([countryCode, ruleVersion])
+}
+
+model TaxReport {
+  id          String     @id @default(uuid())
+  userId      String
+  user        User       @relation(fields: [userId], references: [id])
+  period      String
+  countryCode String
+  totalGain   Decimal
+  status      String
+  events      TaxEvent[]
+  createdAt   DateTime   @default(now())
+}
+
+model AnchorRecord {
+  id          String   @id @default(uuid())
+  payloadHash String   @unique
+  anchorType  String
+  chainTxHash String?
+  blockNumber BigInt?
+  status      String   @default("pending")
+  attempts    Int      @default(0)
+  anchoredAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  // Privacy boundary: intentionally no User relation or userId column.
+  @@index([status])
+}
