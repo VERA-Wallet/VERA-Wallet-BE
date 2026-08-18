@@ -5,7 +5,7 @@ import type { Request } from "express";
 import { ExtractJwt, Strategy } from "passport-jwt";
 import { Inject } from "@nestjs/common";
 import type { UserRepository } from "../identity/identity.repository";
-import { USER_REPOSITORY } from "../shared/tokens";
+import { USER_REPOSITORY } from "../identity/identity.tokens";
 import type { JwtPayload } from "./auth.types";
 
 const cookieExtractor = (request: Request) => request?.cookies?.vw_access_token ?? null;

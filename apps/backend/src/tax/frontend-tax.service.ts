@@ -1,10 +1,11 @@
-import { BadRequestException, Injectable } from "@nestjs/common";
+import { BadRequestException, Inject, Injectable } from "@nestjs/common";
 import { calculateFrontendEstimate, listFrontendRuleSets } from "@vera/tax-engine";
-import { TransactionAvailabilityService } from "../indexer/transaction-availability.service";
+import type { TransactionAvailabilityPort } from "../indexer/transaction.repository";
+import { TRANSACTION_AVAILABILITY } from "../indexer/indexer.tokens";
 
 @Injectable()
 export class FrontendTaxService {
-  constructor(private readonly transactions: TransactionAvailabilityService) {}
+  constructor(@Inject(TRANSACTION_AVAILABILITY) private readonly transactions: TransactionAvailabilityPort) {}
   listRuleSets() { return listFrontendRuleSets(); }
   async estimate(userId: string, country: string, taxYear: number, _source: "scenario" | "wallet") {
     const transactions = await this.transactions.listOrSync(userId);

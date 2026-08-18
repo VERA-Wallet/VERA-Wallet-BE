@@ -1,13 +1,14 @@
 import { Inject, Injectable, NotFoundException } from "@nestjs/common";
 import { ESTIMATE_DISCLAIMER } from "@vera/tax-engine";
 import { keccak256, toBytes } from "viem";
-import type { ReportRepository } from "../tax/tax.repository";
-import { AnchorSubmissionService } from "../anchor/anchor-submission.service";
-import { REPORT_REPOSITORY } from "../shared/tokens";
+import type { AnchorSubmissionPort } from "../anchor/anchor.port";
+import { ANCHOR_SUBMISSION } from "../anchor/anchor.tokens";
+import type { ReportRepository } from "./report.repository";
+import { REPORT_REPOSITORY } from "./report.tokens";
 
 @Injectable()
 export class ReportService {
-  constructor(@Inject(REPORT_REPOSITORY) private readonly reports: ReportRepository, private readonly anchors: AnchorSubmissionService) {}
+  constructor(@Inject(REPORT_REPOSITORY) private readonly reports: ReportRepository, @Inject(ANCHOR_SUBMISSION) private readonly anchors: AnchorSubmissionPort) {}
 
   async get(userId: string, reportId: string) {
     const report = await this.reports.findReport(userId, reportId);

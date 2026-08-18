@@ -2,7 +2,7 @@ import { Inject, Injectable } from "@nestjs/common";
 import { InjectQueue, Process, Processor } from "@nestjs/bull";
 import type { Job, Queue } from "bull";
 import type { AnchorType } from "@vera/interfaces";
-import { ANCHOR_DISPATCHER } from "../shared/tokens";
+import { ANCHOR_DISPATCHER } from "./anchor.tokens";
 import { AnchorService, type AnchorDispatcher } from "./anchor.service";
 
 @Injectable()

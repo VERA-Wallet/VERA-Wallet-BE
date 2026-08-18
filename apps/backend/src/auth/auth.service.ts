@@ -4,12 +4,11 @@ import { ConfigService } from "@nestjs/config";
 import { JwtService } from "@nestjs/jwt";
 import type { IdentityProvider } from "@vera/interfaces";
 import type { VerifiedIdentityRepository } from "../identity/identity.repository";
-import { IDENTITY_PROVIDER, IDENTITY_REPOSITORY } from "../shared/tokens";
+import { IDENTITY_PROVIDER, IDENTITY_REPOSITORY } from "../identity/identity.tokens";
 import type { JwtPayload } from "./auth.types";
 
 @Injectable()
 export class AuthService {
-  private readonly sessions = new Map<string, number>();
   constructor(
     @Inject(IDENTITY_PROVIDER) private readonly identity: IdentityProvider,
     @Inject(IDENTITY_REPOSITORY) private readonly identities: VerifiedIdentityRepository,
@@ -18,9 +17,7 @@ export class AuthService {
   ) {}
 
   async start(sessionId: string = randomUUID()) {
-    const request = await this.identity.requestVerification(sessionId);
-    this.sessions.set(sessionId, request.expiresAt.getTime());
-    return request;
+    return this.identity.requestVerification(sessionId);
   }
 
   async callback(token: string, countryCode: string | null = null) {

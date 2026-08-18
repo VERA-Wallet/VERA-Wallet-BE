@@ -1,10 +1,12 @@
 import { Inject, Injectable, NotFoundException } from "@nestjs/common";
 import type { ChainIndexer } from "@vera/interfaces";
 import { keccak256, toBytes } from "viem";
-import { AnchorSubmissionService } from "../anchor/anchor-submission.service";
+import type { AnchorSubmissionPort } from "../anchor/anchor.port";
+import { ANCHOR_SUBMISSION } from "../anchor/anchor.tokens";
 import type { WalletRepository } from "../wallet/wallet.repository";
+import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import type { TransactionSyncRepository } from "./transaction.repository";
-import { CHAIN_INDEXER, TRANSACTION_SYNC_REPOSITORY, WALLET_REPOSITORY } from "../shared/tokens";
+import { CHAIN_INDEXER, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
 
 @Injectable()
 export class IndexerService {
@@ -12,7 +14,7 @@ export class IndexerService {
     @Inject(CHAIN_INDEXER) private readonly indexer: ChainIndexer,
     @Inject(WALLET_REPOSITORY) private readonly wallets: WalletRepository,
     @Inject(TRANSACTION_SYNC_REPOSITORY) private readonly transactions: TransactionSyncRepository,
-    private readonly anchors: AnchorSubmissionService,
+    @Inject(ANCHOR_SUBMISSION) private readonly anchors: AnchorSubmissionPort,
   ) {}
 
   async sync(userId: string) {

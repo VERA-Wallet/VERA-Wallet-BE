@@ -8,7 +8,7 @@ VERA Wallet의 NestJS 백엔드입니다. 서버는 개인키를 생성하거나
 - `packages/interfaces`: OmniOne CX/Chain과 인덱서 포트
 - `packages/tax-engine`: NestJS에 의존하지 않는 순수 TypeScript 계산 패키지
 - `MOCK_MODE=true`: 외부 시스템과 DB/Redis 없이 전체 데모 흐름 실행
-- `MOCK_MODE=false`: Prisma/PostgreSQL과 Bull/Redis 사용. OmniOne/Alchemy 실연동은 공급자 최종 명세를 기다리는 안전한 뼈대이며 명시적으로 503을 반환합니다.
+- `MOCK_MODE=false`: Prisma/PostgreSQL과 Bull/Redis 사용. OmniOne Chain 앵커는 `ANCHOR_PRIVATE_KEY`(필수)와 `OMNIONE_API_KEY`가 설정되면 실제 트랜잭션을 전송하고, 키가 없으면 503을 반환합니다. `ANCHOR_CONTRACT_ADDRESS`를 지정하면 앵커 컨트랙트의 `anchor(bytes32,string)`을 호출하고, 비워두면 자기 주소로 payloadHash+type을 calldata에 담은 트랜잭션을 보냅니다. OmniOne CX/Alchemy는 여전히 공급자 최종 명세를 기다리는 503 뼈대입니다.
 
 내부 의존성 방향과 SOLID 경계는 [docs/architecture.md](docs/architecture.md)에 정리되어 있으며 아키텍처 테스트로 강제됩니다. FE 연동 담당자는 [docs/frontend-integration.md](docs/frontend-integration.md)를 먼저 확인하십시오.
 

@@ -2,8 +2,9 @@ import { BadRequestException, Injectable } from "@nestjs/common";
 import { calculateTaxEvents, ESTIMATE_DISCLAIMER, summarize } from "@vera/tax-engine";
 import { Inject } from "@nestjs/common";
 import type { TransactionRepository } from "../indexer/transaction.repository";
+import { TRANSACTION_REPOSITORY } from "../indexer/indexer.tokens";
 import type { TaxRepository } from "./tax.repository";
-import { TAX_REPOSITORY, TRANSACTION_REPOSITORY } from "../shared/tokens";
+import { TAX_REPOSITORY } from "./tax.tokens";
 
 @Injectable()
 export class TaxService {

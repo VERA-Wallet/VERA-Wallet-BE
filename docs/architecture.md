@@ -2,7 +2,7 @@
 
 ## Dependency direction
 
-Controllers call application services. Application services depend on narrow repository interfaces or external ports. The composition root binds those ports to Mock or Prisma implementations according to `MOCK_MODE`.
+Controllers call application services. Application services depend on narrow repository interfaces or external ports. Each feature module owns its ports and binds them to Mock or Prisma implementations according to `PERSISTENCE`/`MOCK_MODE`; the application module only composes feature modules.
 
 ```text
 HTTP controller
@@ -14,7 +14,14 @@ domain port (interface/token)
 Mock adapter | Prisma adapter | external adapter
 ```
 
-Domain services and controllers must not import `PrismaService` or `@prisma/client`. Repository port files must not import NestJS or Prisma. `test/architecture.spec.ts` enforces both rules.
+Domain services and controllers must not import `PrismaService` or `@prisma/client`. Repository port files must not import NestJS or Prisma. Shared infrastructure must not import feature modules, cross-feature consumers use exported ports rather than concrete services, and feature providers are not global. `test/architecture.spec.ts` enforces these rules.
+
+## Module ownership
+
+- Each feature owns its repository tokens, adapters and provider selection.
+- `SharedModule` exports only database infrastructure and never imports a feature.
+- Cross-feature dependencies are explicit Nest module imports. Anchor submission/query and transaction availability are exposed as narrow ports.
+- Tax report persistence is owned by `ReportPersistenceModule` and shared with the Tax calculation and Report workflow modules through separate reader/writer ports.
 
 ## Responsibility boundaries
 

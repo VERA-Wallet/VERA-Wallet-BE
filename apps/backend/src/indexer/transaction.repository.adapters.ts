@@ -15,7 +15,11 @@ export class MockTransactionRepository implements TransactionRepository, Transac
     const stored: TransactionRecord[] = [];
     for (const item of sourceItems) {
       const existing = [...this.transactions.values()].find((tx) => tx.bindingId === bindingId && tx.txHash === item.txHash && tx.eventType === item.eventType);
-      if (existing) { stored.push(existing); continue; }
+      if (existing) {
+        Object.assign(existing, { payload: item.payload, occurredAt: item.occurredAt });
+        stored.push(existing);
+        continue;
+      }
       const value = { id: randomUUID(), bindingId, txHash: item.txHash, eventType: item.eventType, chain: item.chain, payload: item.payload, occurredAt: item.occurredAt };
       this.transactions.set(value.id, value);
       stored.push(value);

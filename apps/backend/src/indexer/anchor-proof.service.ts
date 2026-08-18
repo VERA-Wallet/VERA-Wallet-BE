@@ -1,10 +1,12 @@
 import { BadRequestException, Injectable, NotFoundException } from "@nestjs/common";
-import { AnchorService } from "../anchor/anchor.service";
+import { Inject } from "@nestjs/common";
+import type { AnchorQueryPort } from "../anchor/anchor.port";
+import { ANCHOR_QUERY } from "../anchor/anchor.tokens";
 import { TransactionService } from "./transaction.service";
 
 @Injectable()
 export class AnchorProofService {
-  constructor(private readonly transactions: TransactionService, private readonly anchors: AnchorService) {}
+  constructor(private readonly transactions: TransactionService, @Inject(ANCHOR_QUERY) private readonly anchors: AnchorQueryPort) {}
   async get(userId: string, eventId?: string) {
     if (!eventId) throw new BadRequestException("eventId is required.");
     const transaction = await this.transactions.get(userId, eventId);

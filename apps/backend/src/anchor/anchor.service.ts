@@ -1,10 +1,11 @@
 import { Inject, Injectable } from "@nestjs/common";
 import type { AnchorType, EvidenceAnchor } from "@vera/interfaces";
 import type { AnchorRepository } from "./anchor.repository";
-import { ANCHOR_REPOSITORY, EVIDENCE_ANCHOR } from "../shared/tokens";
+import type { AnchorQueryPort } from "./anchor.port";
+import { ANCHOR_REPOSITORY, EVIDENCE_ANCHOR } from "./anchor.tokens";
 
 @Injectable()
-export class AnchorService {
+export class AnchorService implements AnchorQueryPort {
   constructor(@Inject(EVIDENCE_ANCHOR) private readonly adapter: EvidenceAnchor, @Inject(ANCHOR_REPOSITORY) private readonly anchors: AnchorRepository) {}
   async prepare(payloadHash: string, type: AnchorType) { return this.anchors.create(payloadHash, type); }
   async process(payloadHash: string, type: AnchorType) {

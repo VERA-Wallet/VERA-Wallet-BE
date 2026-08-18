@@ -14,6 +14,9 @@ describe("VERA Wallet mock journey", () => {
   let app: INestApplication;
   beforeAll(async () => {
     process.env.MOCK_MODE = "true";
+    // PERSISTENCE는 MOCK_MODE보다 우선한다. 로컬 .env가 prisma로 켜져 있으면 이 테스트가 개발용 DB에
+    // 붙어 버려서, 이전 실행이 남긴 행까지 세느라 건수 단언이 깨진다. 여기서 인메모리로 못박는다.
+    process.env.PERSISTENCE = "memory";
     process.env.JWT_SECRET = "test-only-verawallet-secret-at-least-32-chars";
     const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = module.createNestApplication();

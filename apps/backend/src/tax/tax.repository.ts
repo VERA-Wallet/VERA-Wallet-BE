@@ -5,8 +5,3 @@ export interface TaxRepository {
   createReport(userId: string, period: string, countryCode: string, totalGain: string, events: CalculatedTaxEvent[]): Promise<ReportRecord>;
   listEvents(userId: string, countryCode?: string): Promise<TaxEventRecord[]>;
 }
-export interface ReportRepository {
-  findReport(userId: string, id: string): Promise<ReportRecord | null>;
-  listReportEvents(userId: string, reportId: string): Promise<TaxEventRecord[]>;
-  setReportStatus(userId: string, id: string, status: string): Promise<ReportRecord | null>;
-}

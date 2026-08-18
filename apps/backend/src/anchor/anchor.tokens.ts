@@ -1,0 +1,5 @@
+export const EVIDENCE_ANCHOR = Symbol("EVIDENCE_ANCHOR");
+export const ANCHOR_DISPATCHER = Symbol("ANCHOR_DISPATCHER");
+export const ANCHOR_REPOSITORY = Symbol("ANCHOR_REPOSITORY");
+export const ANCHOR_SUBMISSION = Symbol("ANCHOR_SUBMISSION");
+export const ANCHOR_QUERY = Symbol("ANCHOR_QUERY");

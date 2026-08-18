@@ -9,3 +9,7 @@ export interface TransactionRepository {
 export interface TransactionSyncRepository {
   save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]): Promise<TransactionRecord[]>;
 }
+
+export interface TransactionAvailabilityPort {
+  listOrSync(userId: string): Promise<TransactionRecord[]>;
+}
