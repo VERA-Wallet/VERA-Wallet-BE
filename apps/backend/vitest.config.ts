@@ -13,5 +13,6 @@ export default defineConfig({
       "@vera/tax-engine": fileURLToPath(new URL("../../packages/tax-engine/src/index.ts", import.meta.url)),
     },
   },
-  test: { environment: "node", globals: true, hookTimeout: 20_000, testTimeout: 20_000 },
+  // 테스트는 mock 여정을 전제한다. 개발자의 로컬 .env(MOCK_MODE=false 등)에 흔들리지 않게 고정한다.
+  test: { environment: "node", globals: true, hookTimeout: 20_000, testTimeout: 20_000, env: { MOCK_MODE: "true" } },
 });

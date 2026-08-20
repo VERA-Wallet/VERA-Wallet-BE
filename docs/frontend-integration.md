@@ -24,7 +24,16 @@ Browser → localhost:3100/api/* → Next.js beforeFiles rewrite → localhost:3
 | `MOCK_MODE=true` | 인메모리 | Mock OmniOne/Alchemy | `mock` |
 | `MOCK_MODE=false` | PostgreSQL + Redis | Real 어댑터 | `live` |
 
-현재 Real OmniOne CX, OmniOne Chain 쓰기, Alchemy 어댑터는 안전한 TODO 뼈대이며 호출 시 `503`입니다. 따라서 첫 연동 목표는 **FE 내부 Mock을 NestJS Mock API로 교체하는 것**입니다.
+현재 Real OmniOne CX 본인확인 어댑터는 **미구현**입니다(`OmniOneCxAdapter.handleCallback`이 TODO이며 호출 시 `503`). OmniOne Chain 쓰기와 Alchemy 어댑터도 같은 상태의 TODO 뼈대입니다. FE→BE 토큰 전달 경로는 완성되어 있으므로, Real 전환에 남은 것은 이 어댑터의 CX server-to-server 검증 구현 하나입니다. 따라서 첫 연동 목표는 **FE 내부 Mock을 NestJS Mock API로 교체하는 것**입니다.
+
+### OmniOne CX 표준인증창 (Real 모드 본인확인)
+
+Real 모드에서 모바일신분증 로그인은 라온시큐어 호스팅 표준인증창을 사용합니다.
+
+1. FE는 `NEXT_PUBLIC_OMNIONE_CX_AUTH_URL` 설정 시 로그인 버튼에서 CX 인증창을 엽니다(`verawallet-fe/lib/omnione/oacx.ts`가 `oacx-vendor.js`, `oacx-ux.js`, `oacx-ux.css` 로드와 `<div id="oacxDiv">` 마운트를 담당).
+2. `OACX.LOAD_MODULE("<OMNIONE_CX_AUTH_URL>/config/config.mid.json", { contentInfo: { signType: "ENT_MID" }, compareCI: false, isBirth: true }, cb)` 호출 시 표준인증창이 QR(데스크톱) 또는 딥링크(모바일)를 표시하고, 사용자가 모바일신분증 앱으로 제출하면 성공 콜백에 `res.token`이 전달됩니다. 배포된 모듈은 boolean `isBirth`를 필수로 요구하며 `compareCI`/`isBirth`는 정확히 하나만 true여야 합니다(가이드북 p.23 샘플에는 누락된 제약).
+3. FE는 이 토큰을 `POST /api/auth/did/present`의 `cxToken` 필드로 전달합니다(코어 API를 직접 쓰는 경우 `POST /auth/verify/callback`의 `token`). BE는 이 값을 `PresentDidDto.cxToken`으로 받아 `AuthService.callback` → `IdentityProvider.handleCallback`까지 그대로 넘깁니다. 이후 CX 서버와 server-to-server로 토큰을 교환·파싱하고 CI 해시(`didHash`)만 저장하는 부분이 `OmniOneCxAdapter`의 남은 TODO입니다. 원본 신원 클레임은 FE·DB 어디에도 저장하지 않습니다.
+4. Mock 모드(`MOCK_MODE=true`)에서는 토큰이 어댑터까지 전달되지만 `MockIdentityAdapter`가 검증 없이 고정 신원을 반환하며, `cxToken`이 없으면 `mock-did-<country>` 폴백으로 세션을 발급합니다(e2e·계약 테스트 경로). 이 폴백은 MOCK_MODE에서만 허용되고 `MOCK_MODE=false`에서는 토큰 없는 제시가 `401`입니다 — 인증창을 건너뛴 로그인을 막습니다. `NEXT_PUBLIC_OMNIONE_CX_AUTH_URL`을 비워 두면 FE는 기존 mock QR 프레젠테이션을 유지합니다.
 
 ## 2. 개발 서버 실행
 
@@ -495,7 +504,7 @@ Content-Type: application/json
 3. `/api/auth/session`의 `chainId`는 바인딩 존재 시 현재 `1`로 반환됩니다. 실제 SIWE chain ID 영속화는 후속 스키마 작업이 필요합니다.
 4. `source: "scenario"`는 아직 별도 scenario fixture를 사용하지 않습니다.
 5. `profile`과 `includeMarginal`은 현재 호환 DTO에서 허용되지만 계산에는 반영되지 않습니다.
-6. Real 외부 어댑터는 TODO이므로 `MOCK_MODE=false`만 설정한다고 실데이터가 활성화되지는 않습니다.
+6. Real 모드에서 OmniOne CX 본인확인은 동작하지만(1장 표준인증창 참조), Chain 쓰기/Alchemy 어댑터는 TODO이므로 `MOCK_MODE=false`만 설정한다고 모든 실데이터가 활성화되지는 않습니다.
 7. `provenance: "live"`를 받을 수 있도록 FE runtime schema를 확장해야 Real 모드로 전환할 수 있습니다.
 
 ## 10. FE 연동 체크리스트
