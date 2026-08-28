@@ -5,14 +5,17 @@ import cookieParser from "cookie-parser";
 import request from "supertest";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { SiweMessage } from "siwe";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { AppModule } from "../src/app.module";
 import { HttpExceptionEnvelopeFilter } from "../src/shared/http-exception.filter";
 import type { INestApplication } from "@nestjs/common";
 
 describe("VERA Wallet mock journey", () => {
   let app: INestApplication;
-  beforeAll(async () => {
+  // Each test gets a fresh app + in-memory store: the fixed mock DID yields one shared user, so
+  // sharing the app would let one test's bound+synced wallet leak into the next (multi-wallet sync
+  // would then double the fixtures). Isolation keeps each contract assertion single-wallet.
+  beforeEach(async () => {
     process.env.MOCK_MODE = "true";
     // PERSISTENCE는 MOCK_MODE보다 우선한다. 로컬 .env가 prisma로 켜져 있으면 이 테스트가 개발용 DB에
     // 붙어 버려서, 이전 실행이 남긴 행까지 세느라 건수 단언이 깨진다. 여기서 인메모리로 못박는다.
@@ -25,7 +28,7 @@ describe("VERA Wallet mock journey", () => {
     app.useGlobalFilters(new HttpExceptionEnvelopeFilter());
     await app.init();
   });
-  afterAll(async () => app.close());
+  afterEach(async () => app.close());
 
   it("completes identity → bind → sync → tax → report → anchor", async () => {
     const callback = await request(app.getHttpServer()).post("/auth/verify/callback").send({ token: "demo-token", country: "KR" }).expect(201);
@@ -70,7 +73,8 @@ describe("VERA Wallet mock journey", () => {
     await browser.post("/api/auth/verify").send({ message, signature }).expect(201);
 
     const session = await browser.get("/api/auth/session").expect(200);
-    expect(session.body.data).toMatchObject({ didVerified: true, countryCode: "US", walletAddress: account.address, chainId: 1 });
+    expect(session.body.data).toMatchObject({ didVerified: true, countryCode: "US", walletAddress: account.address, walletVerification: "siwe" });
+    expect(session.body.data).not.toHaveProperty("chainId"); // chain facts come from indexed events, not the session
     const list = await browser.get("/api/events?limit=5").expect(200);
     expect(list.body.data.items).toHaveLength(5);
     expect(list.body.data.items[0]).toMatchObject({ version: 1, event: { id: "event-01", price_status: "ESTIMATED" } });
@@ -83,5 +87,20 @@ describe("VERA Wallet mock journey", () => {
     expect(estimate.body.data.disclaimer).toContain("추정치");
     const proof = await browser.get("/api/anchor-proof?eventId=event-01").expect(200);
     expect(proof.body.data.merkle_root).toMatch(/^0x[0-9a-f]{64}$/);
+  });
+
+  it("binds a watch-only wallet: 401 unauth, 400 invalid, 201 + checksum, session marks watch_only", async () => {
+    const server = app.getHttpServer();
+    const checksummed = "0x8A361b90E7F153eEdEb91ef2b2c7Fa4Dd68ceeee";
+    await request(server).post("/api/auth/wallet/watch").send({ address: checksummed }).expect(401);
+
+    const browser = request.agent(server);
+    await browser.post("/api/auth/did/present").send({ country: "KR" }).expect(201);
+    await browser.post("/api/auth/wallet/watch").send({ address: "0xnothex" }).expect(400);
+    const watch = await browser.post("/api/auth/wallet/watch").send({ address: checksummed.toLowerCase() }).expect(201);
+    expect(watch.body.data).toEqual({ walletAddress: checksummed });
+
+    const session = await browser.get("/api/auth/session").expect(200);
+    expect(session.body.data).toMatchObject({ walletAddress: checksummed, walletVerification: "watch_only" });
   });
 });

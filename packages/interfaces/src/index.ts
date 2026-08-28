@@ -29,8 +29,15 @@ export interface AnchorReceipt {
   anchoredAt: Date;
 }
 
+export interface ChainScanResult {
+  transactions: IndexedTransaction[];
+  // Per-chain scanned head (block number) for chains that were COMPLETELY observed
+  // this pass. Absent chains were skipped/errored/truncated and must not advance a cursor.
+  chainHeads: Record<number, number>;
+}
+
 export interface ChainIndexer {
-  fetchTransactions(address: string): Promise<IndexedTransaction[]>;
+  fetchTransactions(address: string, sinceByChain?: Record<number, bigint>): Promise<ChainScanResult>;
 }
 
 export interface IndexedTransaction {

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-consumer-report",
+  "feature": "deterministic group_id swap-leg pairing (BE + FE)",
+  "commands": [
+    { "command": "pnpm vitest run src/indexer/indexer.adapters.spec.ts", "cwd": "apps/backend", "exitCode": 0, "status": "passed", "summary": "1 file; 53 tests passed (adds multi-hop-no-group_id + bridge-no-group_id coverage)." },
+    { "command": "pnpm exec tsc -p tsconfig.json --noEmit", "cwd": "apps/backend", "exitCode": 0, "status": "passed", "summary": "Typecheck clean." },
+    { "command": "npx vitest run tests/unit/swap-pair.test.ts tests/ui/dashboard-swap-pair.test.tsx", "cwd": "../verawallet-fe", "exitCode": 0, "status": "passed", "summary": "2 files; 8 tests passed." },
+    { "command": "npx tsc --noEmit", "cwd": "../verawallet-fe", "exitCode": 0, "status": "passed", "summary": "Typecheck clean." }
+  ],
+  "adversarialCases": [
+    { "id": "a", "scenario": "split-route: same-asset OUT across 3 legs", "expected": "sum into one OUT/EXCHANGE, share one group_id", "verdict": "passed", "testRef": "apps/backend/src/indexer/indexer.adapters.spec.ts split-route test" },
+    { "id": "b", "scenario": "isSelf leg inside a swap tx", "expected": "dropped; exactly 2 sides remain", "verdict": "passed", "testRef": "indexer.adapters.spec.ts drops intra-swap self-transfer" },
+    { "id": "c", "scenario": "3+ distinct-asset multi-hop", "expected": "UNKNOWN, no group_id, not paired", "verdict": "passed", "testRef": "indexer.adapters.spec.ts treats a 3+ distinct-asset multi-hop as UNKNOWN with no group_id" },
+    { "id": "bridge-no-gid", "scenario": "pure bridge SEND to bridge counterparty (no matching IN)", "expected": "SEND, conf<0.5, bridge_suspected, no group_id", "verdict": "passed", "testRef": "indexer.adapters.spec.ts flags a SEND to a bridge contract for review (+group_id absence assertion)" },
+    { "id": "d", "scenario": "both legs null group_id", "expected": "FE does not pair", "verdict": "passed", "testRef": "verawallet-fe/tests/unit/swap-pair.test.ts group_id absent" },
+    { "id": "e", "scenario": "different group_id same tx", "expected": "FE does not pair", "verdict": "passed", "testRef": "verawallet-fe/tests/unit/swap-pair.test.ts group_id mismatch" },
+    { "id": "f", "scenario": "confidence 0.4 (bridge-suspected)", "expected": "FE does not pair", "verdict": "passed", "testRef": "verawallet-fe/tests/unit/swap-pair.test.ts confidence floor" },
+    { "id": "g", "scenario": "price_status UNKNOWN / fiat_value null", "expected": "FE STILL pairs (the fix)", "verdict": "passed", "testRef": "verawallet-fe/tests/unit/swap-pair.test.ts price unknown still pairs" },
+    { "id": "h", "scenario": "IN leg income_kind STAKING", "expected": "not a swap leg", "verdict": "passed", "testRef": "verawallet-fe/tests/unit/swap-pair.test.ts income receipt is not a swap leg" }
+  ],
+  "endToEnd": {
+    "surface": "live BE /api/events",
+    "evidence": "eeee wallet tx 0xb02fe92 returns both legs with identical group_id '1:0xb02fe92...', OUT EXCHANGE USDT + IN RECEIVE ETH (income_kind null), confidence 0.6; 12 events carry group_id (6 swap pairs), 6 EXCHANGE.",
+    "dbBackfill": "swap 6 pairs: both legs share one group_id; pure RECEIVE/SEND/SPAM/UNKNOWN carry none (psql verified)."
+  },
+  "verdict": "passed"
+}

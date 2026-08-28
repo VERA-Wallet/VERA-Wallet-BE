@@ -12,9 +12,11 @@ export class FrontendSessionController {
 
   @Get("session") async session(@Req() request: Request) {
     const user = await this.readSession(request);
-    if (!user) return success({ didVerified: false, countryCode: null, walletAddress: null, chainId: null });
+    if (!user) return success({ didVerified: false, countryCode: null, walletAddress: null, walletVerification: null });
     const binding = await this.wallets.findLatestByUser(user.sub);
-    return success({ didVerified: true, countryCode: user.countryCode, walletAddress: binding?.walletAddress ?? null, chainId: binding ? 1 : null });
+    // No chainId claim: an EVM address is chain-agnostic and the wallet's network at signing time
+    // is incidental. Active chains are a fact of indexed data (event chain_id), not of the session.
+    return success({ didVerified: true, countryCode: user.countryCode, walletAddress: binding?.walletAddress ?? null, walletVerification: binding?.verificationMethod ?? null });
   }
 
   private async readSession(request: Request) {

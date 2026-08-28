@@ -4,7 +4,7 @@ import { CurrentUser } from "../auth/current-user.decorator";
 import { JwtAuthGuard } from "../auth/jwt-auth.guard";
 import type { AuthenticatedUser } from "../auth/auth.types";
 import { success } from "../shared/api";
-import { BindChallengeDto, BindWalletDto, SiweNonceDto, SiweVerifyDto } from "./wallet.dto";
+import { BindChallengeDto, BindWalletDto, SiweNonceDto, SiweVerifyDto, WatchWalletDto } from "./wallet.dto";
 import { WalletService } from "./wallet.service";
 
 @UseGuards(JwtAuthGuard)
@@ -23,5 +23,8 @@ export class FrontendWalletController {
   @Post("verify") async verify(@CurrentUser() user: AuthenticatedUser, @Body() body: SiweVerifyDto) {
     const result = await this.wallets.bindSiwe(user, body);
     return success({ walletAddress: result.walletAddress, chainId: new SiweMessage(body.message).chainId });
+  }
+  @Post("wallet/watch") async watch(@CurrentUser() user: AuthenticatedUser, @Body() body: WatchWalletDto) {
+    return success(await this.wallets.watch(user, body.address));
   }
 }

@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "kind": "algorithm-boundary-report",
+  "feature": "moving-average cost basis + realized P/L engine (tax-engine)",
+  "surface": "pure function packages/tax-engine/src/core/cost-basis.ts computeCostBasis",
+  "commands": [
+    {
+      "command": "pnpm exec vitest run src/core/cost-basis.spec.ts",
+      "cwd": "packages/tax-engine",
+      "exitCode": 0,
+      "status": "passed",
+      "summary": "1 test file; 11 tests passed (incl. gen-2 hardening: NaN/Infinity guard, log_index tie-break)."
+    }
+  ],
+  "boundaryCases": [
+    {
+      "id": "single",
+      "scenario": "buy 1 @1,000,000 / sell 1 @1,500,000",
+      "expected": "cost 1,000,000, pnl +500,000, ratio 0.5",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: computes realized P/L and ratio for a single acquire + dispose"
+    },
+    {
+      "id": "reaverage",
+      "scenario": "two acquisitions at different prices then disposal",
+      "expected": "moving average cost basis and zero P/L at the average price",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: re-averages cost across multiple acquisitions"
+    },
+    {
+      "id": "no-price",
+      "scenario": "IN with null fiat_value / UNKNOWN price",
+      "expected": "excluded, does not seed average; later sell sees zero holdings, null ratio, and review flag",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: excludes events with a null fiat_value / UNKNOWN price and never mutates holdings"
+    },
+    {
+      "id": "over-disposal",
+      "scenario": "buy 1 then sell 2",
+      "expected": "cost capped at holdings, excess zero-cost, review=disposal_exceeds_holdings",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: caps recognized cost at holdings and flags over-disposal"
+    },
+    {
+      "id": "excluded-classes",
+      "scenario": "SPAM / UNKNOWN / INTERNAL_TRANSFER classifications",
+      "expected": "all excluded and no holdings mutation",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: excludes SPAM / UNKNOWN / INTERNAL_TRANSFER classifications"
+    },
+    {
+      "id": "loss",
+      "scenario": "buy above subsequent sale price",
+      "expected": "negative realized P/L and negative ratio",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: reports losses with a negative P/L and negative ratio"
+    },
+    {
+      "id": "zero-cost-ratio",
+      "scenario": "recognized cost basis is zero",
+      "expected": "realized P/L is retained but pnlRatio is null rather than infinity or a fabricated value",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: returns a null P/L ratio when the recognized cost basis is zero"
+    },
+    {
+      "id": "order-independent",
+      "scenario": "same events supplied in forward and reverse array order",
+      "expected": "identical disposal result after occurredAt ordering",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: is independent of input array order (folds by occurredAt)"
+    },
+    {
+      "id": "per-asset",
+      "scenario": "two asset keys interleaved",
+      "expected": "separate running averages per asset key",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: keeps separate averages per asset key"
+    },
+    {
+      "id": "nan-inf-guard",
+      "scenario": "Infinity fiat_value / NaN raw_amount",
+      "expected": "excluded, never poisons the running average (gen-2)",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: excludes NaN/Infinity fiat and quantity instead of poisoning the average"
+    },
+    {
+      "id": "log-index-tiebreak",
+      "scenario": "same-timestamp buy+sell (swap legs)",
+      "expected": "folds by on-chain log_index so the sell has a real cost basis (gen-2)",
+      "verdict": "passed",
+      "testRef": "packages/tax-engine/src/core/cost-basis.spec.ts :: breaks same-timestamp ties by on-chain log_index"
+    }
+  ],
+  "notes": "Cost basis is computed read-time only. Monetary fields are decimal strings. Excluded events surface as excluded:true with excludeReason and never mutate holdings.",
+  "verdict": "passed"
+}

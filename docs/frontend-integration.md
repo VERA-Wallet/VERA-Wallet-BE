@@ -287,6 +287,30 @@ Cookie: vw_access_token=...
 
 서버는 `viem.verifyMessage`로 서명을 검증하고 `bindingHash`만 앵커링합니다. 개인키는 요청하거나 저장하지 않습니다.
 
+### 5.3-1 워치온리 바인딩 (서명 없이 주소만 관찰)
+
+```http
+POST /api/auth/wallet/watch
+Content-Type: application/json
+Cookie: vw_access_token=...
+
+{ "address": "0x8a361...ceeee" }
+```
+
+```json
+{
+  "data": { "walletAddress": "0x8A361b90E7F153eEdEb91ef2b2c7Fa4Dd68ceeee" },
+  "meta": { "provenance": "mock", "generatedAt": "2026-08-27T00:00:00.000Z" }
+}
+```
+
+- 서명 없이 주소만 등록해 거래 내역을 관찰합니다(`verificationMethod: "watch_only"`). `bindingHash`/`verifiedAt`는 `null`입니다.
+- 응답에 `chainId`가 없습니다. 워치온리 등록에는 서명된 체인이 없고, EVM 주소는 체인 불문 동일하므로 값을 만들어 내려주지 않습니다.
+- 주소는 서버에서 EIP-55 체크섬으로 정규화되어 응답·저장됩니다. 소문자로 보내도 체크섬 형태로 돌아옵니다.
+- 미인증 `401`, 잘못된 EVM 주소 `400`(`code: invalid_address`), 성공 `201`.
+- 같은 주소로 다시 호출해도 안전(멱등)하며, 이미 SIWE로 **검증된 바인딩을 워치온리로 강등하지 않습니다**. 이후 SIWE 검증(`POST /api/auth/verify`)을 하면 같은 바인딩이 자연스럽게 `siwe`로 승격됩니다.
+- **앵커 제출은 검증된(siwe) 바인딩에만** 일어납니다. 워치온리 지갑의 거래는 정상적으로 수집·정규화·저장되지만 앵커링되지 않습니다.
+
 ### 5.4 세션 조회와 로그아웃
 
 ```http
@@ -299,7 +323,7 @@ GET /api/auth/session
     "didVerified": true,
     "countryCode": "KR",
     "walletAddress": "0x...",
-    "chainId": 1
+    "walletVerification": "siwe"
   },
   "meta": {
     "provenance": "mock",
@@ -308,7 +332,9 @@ GET /api/auth/session
 }
 ```
 
-미인증 상태도 `200`이며 네 필드가 `false`/`null`로 반환됩니다.
+- `walletVerification`: `"siwe" | "watch_only" | null`. 최신 바인딩의 검증 방식이며, 바인딩이 없으면 `null`입니다. FE는 이 값으로 미검증(워치온리) 배지를 켤 수 있습니다.
+- 미인증 상태도 `200`이며 모든 필드가 `false`/`null`로 반환됩니다(`walletVerification: null` 포함).
+- **세션에는 `chainId`가 없습니다.** SIWE 서명 시점의 지갑 네트워크는 우연적 사실이고 EVM 주소는 체인 불문 동일합니다. 활동 체인은 이벤트 목록의 `chain_id` 또는 `POST /api/events/resync` 응답의 `chains`에서 파생하십시오. SIWE `chainId`는 nonce 발급과 `POST /api/auth/verify` 응답 echo에만 남습니다(서명 메시지의 실측값).
 
 ```http
 POST /api/auth/logout
@@ -323,11 +349,14 @@ POST /api/auth/logout
 ### 6.1 이벤트 목록
 
 ```http
-GET /api/events?cursor=<event-id>&limit=20
+GET /api/events?cursor=<event-id>&limit=20&includeSpam=false
 ```
 
 - `limit`: 기본 20, 최소 1, 최대 100
 - `cursor`: 마지막으로 받은 event ID
+- `includeSpam`: 기본 `false`. 스팸/에어드랍 더스트(`classification: "SPAM"`)는 기본 목록에서 숨겨집니다. `true`로 요청하면 숨김 항목까지 노출되어 오탐을 `PATCH /api/events/:id`로 다시 실제 분류로 되돌릴 수 있습니다.
+
+`SPAM`은 인바운드 전용 수신(누구나 무료로 지갑에 밀어넣을 수 있는 토큰/NFT 더스트)에만 부여되며 세금 계산·`pendingReviewCount`에서 제외됩니다. 절대 삭제되지 않고 앵커 증적과 함께 보존됩니다.
 
 ```ts
 type EventListDTO = {
@@ -355,7 +384,7 @@ type NormalizedEvent = {
   raw_amount: string;
   counterparty: string;
   gas_fee_native: string;
-  classification: "RECEIVE" | "SEND" | "EXCHANGE" | "INTERNAL_TRANSFER" | "UNKNOWN";
+  classification: "RECEIVE" | "SEND" | "EXCHANGE" | "INTERNAL_TRANSFER" | "UNKNOWN" | "SPAM";
   confidence: number;
   user_override: {
     classification: NormalizedEvent["classification"];
@@ -365,6 +394,23 @@ type NormalizedEvent = {
   price_status: "RESOLVED" | "UNKNOWN" | "ESTIMATED";
   fiat_value: string | null;
   fiat_currency: string;
+  // 이동평균법 원가·손익(서버가 조회 시점에 전체 이력을 fold해 계산; DB 미저장, 추정치).
+  // fiat_currency 단위 소수 문자열. 계산 불가(SPAM/UNKNOWN/미가격) 이벤트는 셋 다 null.
+  cost_basis: string | null; // IN=취득 총원가, OUT=처분 수량의 인식 원가
+  pnl: string | null; // 실현손익. 취득(IN)/제외 이벤트는 null, 처분(OUT/EXCHANGE)만 값
+  pnl_ratio: string | null; // pnl / cost_basis (0.5 = +50%). 원가 0이면 null
+  // 처분 수량이 추적 보유분을 초과한 경우에만 존재(초과분은 원가 0으로 인식, 검토 필요).
+  pnl_review?: "disposal_exceeds_holdings";
+  // 스왑 페어링 키(서버 발급). 하나의 스왑을 이루는 처분(OUT/EXCHANGE) leg와
+  // 취득(IN/RECEIVE) leg가 동일한 값을 가진다. FE는 이 값이 같은 leg끼리 한 줄로
+  // 묶으면 되며, tx_hash나 leg 개수 휴리스틱은 쓰지 않는다. 불투명 문자열로 취급할 것
+  // (현재 파생식은 chain:txHash이지만 향후 브릿지·수수료 등 다중 leg 액션이 같은
+  // 필드를 다른 파생식으로 재사용한다). 페어링 대상이 아닌 leg에는 필드가 없다.
+  group_id?: string;
+  // DexScreener 현재 시세(표시 전용). ERC20 leg에만 채워지며, 조회 실패(UNKNOWN)나
+  // 네이티브/NFT에는 필드가 없습니다. 세금 기준가(fiat_value)와는 별개입니다.
+  market_price_usd?: string | null;
+  market_liquidity_usd?: number | null;
 };
 ```
 
@@ -416,6 +462,7 @@ type SummaryDTO = {
   computableEventCount: number;
   taxableEventCount: number;
   pendingReviewCount: number;
+  spamEventCount: number;
   currency: string;
   period: { from: string; to: string };
 };
@@ -435,6 +482,29 @@ type AnchorProof = {
   explorer_url: string;
 };
 ```
+
+### 6.6 수동 재동기화 (증분)
+
+동기화 모델은 **수동 전용**입니다. 대시보드 최초 진입 시 바인딩별로 **한 번만** 최초 동기화가 자동 실행되고(그 순간 `initialSyncedAt` 마커가 기록됨), 그 이후로는 읽기(`GET /api/events`, `/api/events/summary`)가 **다시는 자동 동기화하지 않습니다**. 새 온체인 거래를 가져오려면 사용자가 아래 엔드포인트를 호출해야 합니다(예: "새로고침" 버튼).
+
+```http
+POST /api/events/resync
+```
+
+- 인증: JWT 쿠키(`vw_access_token`).
+- 동작: 사용자의 **모든** 바인딩 지갑을 대상으로 강제 증분 동기화(체인별 `fromBlock=커서`..`toBlock=현재 head`). 최초 sync 이후 저장된 커서 이후의 새 블록만 가져오므로 전체 히스토리를 다시 긁지 않습니다.
+- 응답: `success({ bindings, fetched, normalized, chains, skipped })`. `chains`는 지원 체인 전체를 항상 포함하는 체인별 수집 건수 배열 `{ chainId: number; fetched: number }[]`입니다(0 허용, 레지스트리 순서 `[1, 8453, 42161, 10, 137]`) — 불러오기 모달이 이 한 응답으로 체인별 완료 상태를 그릴 수 있습니다. `skipped`는 JSON-safe 진단 배열 `{ bindingId: string; chainId?: number; code: string; message?: string }`입니다(예: `chain_incomplete`, `binding_unavailable`, `anchor_enqueue_failed`). 모든 바인딩이 관측 불가면 `503`.
+- **stale-until-refresh**: 이 호출 전까지 목록은 마지막 동기화 시점의 상태를 보여줍니다. 자동 백그라운드/주기 동기화는 후속 과제입니다.
+
+프록시: 이 경로는 기존 `/api/events/*` allowlist 와일드카드로 프록시됩니다(재분류 `PATCH /api/events/:id`와 동일). FE 프록시가 **POST를 쿠키·바디와 함께 전달**하는지 확인하세요(현재 PATCH가 그렇게 동작). 최소 FE 트리거("새로고침" 버튼)는 FE 레포 후속 작업입니다.
+
+### 6.7 브릿지 의심 (보수적 플래그)
+
+크로스체인 브릿지 이동은 출발체인 SEND와 도착체인 RECEIVE가 서로 다른 tx·체인이라 상관관계로 묶이지 않습니다. BE는 트랜잭션의 상대주소(`counterparty`)가 **알려진 브릿지 컨트랙트**이면 그 레그를 "브릿지 의심"으로 **플래그**합니다. 정책은 보수적입니다:
+
+- **분류는 바뀌지 않습니다** (SEND는 그대로 처분 = 세금 계산에 남음). 레지스트리 오탐으로 실제 처분이 누락되는 것을 막기 위해 자동 재분류하지 않습니다.
+- 대신 해당 레그의 `confidence`를 FE 확인-필요 기준(0.5) **미만(0.4)** 으로 낮춰 기존 `needsReview`(신뢰도 낮음)가 바로 플래그합니다. 사용자가 확인 후 수동으로 `INTERNAL_TRANSFER`(자기 이동·비과세)로 재분류할 수 있습니다.
+- payload에 `bridge_suspected: true` 불리언 힌트가 실립니다(브릿지 의심 레그에만). 현재 FE zod는 미정의 키를 드롭하므로 **계약이 깨지지 않으며**, 나중에 FE가 이 필드를 읽어 "브릿지 의심" 전용 사유를 보이면 됩니다(FE 후속). `bridge_dest_chain_id`는 출발 레그만으로는 도착 체인을 확정할 수 없어 null입니다(크로스체인 페어링은 후속).
 
 ## 7. 세금 API
 
@@ -501,7 +571,7 @@ Content-Type: application/json
 
 1. FE 내부 `/api/auth/nonce`는 익명 요청도 받지만 Backend 호환 API는 DID JWT 쿠키를 요구합니다. 정상 온보딩 순서는 DID → nonce → SIWE입니다.
 2. FE 내부 DID 재제시는 이전 지갑 상태를 초기화하지만 Backend v1은 기존 DB 바인딩을 삭제하지 않습니다.
-3. `/api/auth/session`의 `chainId`는 바인딩 존재 시 현재 `1`로 반환됩니다. 실제 SIWE chain ID 영속화는 후속 스키마 작업이 필요합니다.
+3. 세션·워치온리 응답의 `chainId`는 **제거되었습니다**(이전: 하드코딩 `1`). SIWE chain ID는 영속화하지 않기로 확정 — 서명 시점 네트워크는 우연적 사실이며, 활동 체인은 인덱싱된 이벤트 데이터에서 파생합니다. FE는 세션 Zod 스키마에서 `chainId`를 제거해야 합니다.
 4. `source: "scenario"`는 아직 별도 scenario fixture를 사용하지 않습니다.
 5. `profile`과 `includeMarginal`은 현재 호환 DTO에서 허용되지만 계산에는 반영되지 않습니다.
 6. Real 모드에서 OmniOne CX 본인확인은 동작하지만(1장 표준인증창 참조), Chain 쓰기/Alchemy 어댑터는 TODO이므로 `MOCK_MODE=false`만 설정한다고 모든 실데이터가 활성화되지는 않습니다.

@@ -9,6 +9,9 @@ export class BindWalletDto {
   @IsString() signature!: string;
   @IsString() nonce!: string;
 }
+export class WatchWalletDto {
+  @IsEthereumAddress() address!: string;
+}
 export class SiweNonceDto {
   @IsInt() @Min(1) chainId!: number;
 }

@@ -11,6 +11,8 @@ export class WalletService {
   issueBindingChallenge(user: AuthenticatedUser) { return this.challenges.issueBinding(user); }
   issueSiweChallenge(user: AuthenticatedUser, chainId: number) { return this.challenges.issueSiwe(user, chainId); }
 
+  watch(user: AuthenticatedUser, address: string) { return this.bindings.watch(user, address); }
+
   async bind(user: AuthenticatedUser, input: { address: string; message: string; signature: string; nonce: string }) {
     const challenge = this.challenges.consume(input.nonce, user.sub);
     if (input.message !== challenge.message) throw new BadRequestException({ code: "challenge_mismatch", message: "Signed message does not match challenge." });

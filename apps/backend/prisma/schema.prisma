@@ -35,16 +35,32 @@ model VerifiableCredential {
 }
 
 model WalletBinding {
-  id            String                  @id @default(uuid())
-  userId        String
-  user          User                    @relation(fields: [userId], references: [id])
-  walletAddress String
-  bindingHash   String                  @unique
-  boundAt       DateTime                @default(now())
-  transactions  TransactionNormalized[]
+  id             String                  @id @default(uuid())
+  userId         String
+  user           User                    @relation(fields: [userId], references: [id])
+  walletAddress  String
+  bindingHash    String?                 @unique // null for watch_only: no signature to hash
+  verificationMethod String              // "siwe" | "watch_only"
+  verifiedAt     DateTime?               // set when signature-verified (siwe); null for watch_only
+  boundAt        DateTime                @default(now())
+  initialSyncedAt DateTime?
+  transactions   TransactionNormalized[]
+  cursors        BindingChainCursor[]
 
   @@unique([userId, walletAddress])
   @@index([walletAddress])
+}
+
+model BindingChainCursor {
+  id              String        @id @default(uuid())
+  bindingId       String
+  binding         WalletBinding @relation(fields: [bindingId], references: [id])
+  chainId         Int
+  lastSyncedBlock BigInt
+  lastSyncedAt    DateTime      @default(now())
+
+  @@unique([bindingId, chainId])
+  @@index([bindingId])
 }
 
 model TransactionRaw {
@@ -94,6 +110,17 @@ model TaxReport {
   status      String
   events      TaxEvent[]
   createdAt   DateTime   @default(now())
+}
+
+model HistoricalPrice {
+  id        String   @id @default(uuid())
+  chainId   Int
+  assetKey  String // "native" for the chain's native coin, else the lowercased ERC20 contract
+  date      String // UTC calendar day, YYYY-MM-DD
+  krw       Decimal // daily close, KRW per one whole token
+  fetchedAt DateTime @default(now())
+
+  @@unique([chainId, assetKey, date])
 }
 
 model AnchorRecord {
