@@ -22,6 +22,7 @@ export class AnchorService implements AnchorQueryPort {
   }
   get(payloadHash: string) { return this.anchors.findByHash(payloadHash); }
   verify(txHash: string) { return this.adapter.verify(txHash); }
+  async markFailed(payloadHash: string) { await this.anchors.markFailed(payloadHash); }
 }
 
 export interface AnchorDispatcher { enqueue(payloadHash: string, type: AnchorType): Promise<void>; }

@@ -8,4 +8,7 @@ export interface AnchorSubmissionPort {
 export interface AnchorQueryPort {
   get(payloadHash: string): Promise<AnchorRecordView | null>;
   verify(txHash: string): Promise<boolean>;
+  // Transition a record to `failed` so a later sync retries it (used when enqueue itself rejects,
+  // which would otherwise leave the record stuck `pending` and skipped forever).
+  markFailed(payloadHash: string): Promise<void>;
 }

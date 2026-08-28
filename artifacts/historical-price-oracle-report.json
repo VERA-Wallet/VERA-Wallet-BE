@@ -1,0 +1,149 @@
+{
+  "schemaVersion": 1,
+  "kind": "api-package-test-report",
+  "feature": "historical price oracle, cache, and transaction enrichment",
+  "commands": [
+    {
+      "command": "pnpm exec vitest run src/indexer/historical-price-oracle.spec.ts src/indexer/historical-price-enrichment.service.spec.ts src/indexer/indexer.service.spec.ts",
+      "cwd": "apps/backend",
+      "exitCode": 0,
+      "status": "passed",
+      "summary": "3 test files; 48 tests passed (gen-2..gen-4 hardening: impossible full-timestamp rejection, process-level single-flight dedup, poisoned-close-not-cached, offset->UTC-day keying, trailing-garbage rejection). Expected warning logs exercised the network-throw and oracle-throw best-effort paths."
+    }
+  ],
+  "adversarialCases": [
+    {
+      "id": "oracle-null-failure-modes",
+      "scenario": "HTTP 429 and network rejection from CoinGecko",
+      "expected": "null result (UNKNOWN semantics), never a synthetic zero price",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-oracle.spec.ts :: CoinGeckoHistoricalPriceOracle.priceAt > returns null (UNKNOWN, never 0) on a non-ok HTTP response; returns null on a network throw"
+    },
+    {
+      "id": "oracle-invalid-unsupported-no-fetch",
+      "scenario": "ERC721/ERC1155, unsupported chain, and malformed date",
+      "expected": "null and zero network calls",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-oracle.spec.ts :: CoinGeckoHistoricalPriceOracle.priceAt > returns null for NFTs, unsupported chains, and malformed dates without fetching"
+    },
+    {
+      "id": "oracle-empty-response-vs-failure",
+      "scenario": "HTTP 200 response with no in-day price points",
+      "expected": "null confirmed no-data result; distinct source path from non-OK/throw lookup failure and never coerced to 0",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-oracle.spec.ts :: summarizeDailyClose > returns null for a 200-response with no in-window data (confirmed no-data, not failure); CoinGeckoHistoricalPriceOracle.priceAt > returns null (UNKNOWN, never 0) on a non-ok HTTP response"
+    },
+    {
+      "id": "cache-first-no-external-fetch",
+      "scenario": "Repository has a historical close before enrichment",
+      "expected": "oracle calls = 0 and cached close is used",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-enrichment.service.spec.ts :: HistoricalPriceEnrichmentService.enrich > does not touch the oracle when the price is already cached (cache-first)"
+    },
+    {
+      "id": "asset-day-dedup-and-total-value",
+      "scenario": "Two same-asset, same-day ERC20 rows with quantities 1 and 3 at unit close 1,000,000 KRW",
+      "expected": "one oracle call; fiat_value equals unit close multiplied by each quantity",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-enrichment.service.spec.ts :: HistoricalPriceEnrichmentService.enrich > consults the oracle at most once per (asset, day) and caches the close"
+    },
+    {
+      "id": "null-preservation-and-existing-value-immutability",
+      "scenario": "Null lookup and a row already carrying ESTIMATED fiat value",
+      "expected": "null lookup stays UNKNOWN/null rather than 0; existing fiat_value and status are unchanged with zero oracle calls",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-enrichment.service.spec.ts :: HistoricalPriceEnrichmentService.enrich > leaves the basis UNKNOWN on a null lookup and never coerces to 0; never overwrites an already-priced row (mock path is untouched)"
+    },
+    {
+      "id": "oracle-throw-batch-isolation",
+      "scenario": "Oracle throws while processing an enrich batch",
+      "expected": "batch resolves; affected row remains UNKNOWN",
+      "verdict": "passed",
+      "testRef": "apps/backend/src/indexer/historical-price-enrichment.service.spec.ts :: HistoricalPriceEnrichmentService.enrich > does not fail the batch when the oracle throws (best-effort)"
+    },
+    {
+      "id": "gen2-impossible-date",
+      "scenario": "impossible calendar dates (2025-02-30, 2025-13-01, 2025-00-10)",
+      "expected": "dayWindow returns null via UTC round-trip; no wrong-day pricing",
+      "verdict": "passed",
+      "testRef": "historical-price-oracle.spec.ts :: dayWindow > rejects impossible calendar dates instead of normalizing them"
+    },
+    {
+      "id": "gen2-endpoint-whitelist",
+      "scenario": "NATIVE-with-contract, ERC20-without-contract, blank contract, ERC721",
+      "expected": "endpointKind returns null; never routed to a mismatched endpoint",
+      "verdict": "passed",
+      "testRef": "historical-price-oracle.spec.ts :: endpointKind > whitelists only native (null contract) and ERC20 (non-empty contract)"
+    },
+    {
+      "id": "gen2-nonpositive-close",
+      "scenario": "close value 0, -5, or blank string",
+      "expected": "summarizeDailyClose returns null (KRW price always > 0)",
+      "verdict": "passed",
+      "testRef": "historical-price-oracle.spec.ts :: summarizeDailyClose > rejects non-positive and blank close values"
+    },
+    {
+      "id": "gen2-forced-unknown",
+      "scenario": "unpriced row arriving with stale RESOLVED status; failed lookup",
+      "expected": "price_status forced to UNKNOWN, fiat_value stays null",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: forces price_status UNKNOWN for an unpriced row even if it arrived non-UNKNOWN"
+    },
+    {
+      "id": "gen2-canonical-cache-winner",
+      "scenario": "concurrent miss: our put is a no-op loser, a winner already stored 900,000",
+      "expected": "post-put re-read applies the winner (900,000), not our losing 111,111 lookup",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: applies the canonical persisted close, not a losing concurrent lookup"
+    },
+    {
+      "id": "gen2-poisoned-cache",
+      "scenario": "cached close is 0",
+      "expected": "rejected; fiat_value stays null, status UNKNOWN",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: rejects a poisoned (non-positive) cached close"
+    },
+    {
+      "id": "gen3-impossible-full-timestamp",
+      "scenario": "block_timestamp 2025-02-30T12:00:00Z (Feb 30 does not exist)",
+      "expected": "dateOf validates the raw YYYY-MM-DD prefix before Date.parse; never priced on the normalized March day (0 oracle calls, UNKNOWN)",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: rejects an impossible full timestamp instead of normalizing it to a wrong day"
+    },
+    {
+      "id": "gen3-single-flight",
+      "scenario": "two concurrent enrich() calls on the singleton service for the same key, both held in-flight",
+      "expected": "one shared oracle lookup (process-level single-flight); both rows priced correctly",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: coalesces concurrent enrich calls into one oracle lookup per key (single-flight)"
+    },
+    {
+      "id": "gen3-poison-not-cached",
+      "scenario": "oracle returns a negative close (-5)",
+      "expected": "validated before put; not written to cache (stays retryable, not permanent UNKNOWN)",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: does not cache a poisoned oracle close"
+    },
+    {
+      "id": "gen4-offset-utc-day",
+      "scenario": "block_timestamp 2025-01-03T00:30:00+09:00 (= 2025-01-02T15:30Z)",
+      "expected": "keyed by UTC day 2025-01-02, not the raw local prefix 2025-01-03",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: keys an offset timestamp by its UTC day, not the raw local date prefix"
+    },
+    {
+      "id": "gen4-trailing-garbage",
+      "scenario": "valid date prefix with trailing garbage (2025-01-03XYZ)",
+      "expected": "full-string Date.parse fails -> null; row stays UNKNOWN, 0 oracle calls",
+      "verdict": "passed",
+      "testRef": "historical-price-enrichment.service.spec.ts :: rejects a valid-prefix timestamp with trailing garbage"
+    }
+  ],
+  "endToEnd": {
+    "surface": "IndexerService dependency wiring",
+    "testRef": "apps/backend/src/indexer/indexer.service.spec.ts",
+    "verdict": "passed",
+    "summary": "19 IndexerService tests passed in the same invocation; its harness constructs HistoricalPriceEnrichmentService with MockHistoricalPriceOracle and MockHistoricalPriceRepository."
+  },
+  "verdict": "passed"
+}

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "kind": "package-consumer-report",
+  "feature": "in-DB cross-chain bridge linking (2a) - generation 2 (hardened after boundary review)",
+  "reviewGeneration": 2,
+  "hardening": [
+    "Bidirectional isolated 1:1 matching (OUT has one eligible IN AND that IN has one eligible OUT); greedy forward-only claimedInIds removed.",
+    "Self-healing: candidacy re-derived every run (no bridge_group_id skip), idempotent no-op write skip, per-pair try/catch; a mid-pair write failure is repaired on the next run.",
+    "Canonical asset identity (native / canonical WETH / canonical USDC+USDT contracts) instead of symbol-only; an unknown or spoofed same-symbol token never links.",
+    "Provider-path coverage: an OUT to a LI.FI / Across / Stargate registry address emits bridge_suspected."
+  ],
+  "commands": [
+    { "command": "pnpm vitest run src/indexer", "cwd": "apps/backend", "exitCode": 0, "status": "passed", "summary": "13 files; 142 tests (bridge-linking 11 incl. hardening cases; provider-path adapter test; coexisting historical-price work)." },
+    { "command": "pnpm exec tsc -p tsconfig.json --noEmit", "cwd": "apps/backend", "exitCode": 0, "status": "passed", "summary": "Typecheck clean." },
+    { "command": "SIWE_TRUSTED_ORIGIN= npx vitest run", "cwd": "../verawallet-fe", "exitCode": 0, "status": "passed", "summary": "98 files; 881 tests." },
+    { "command": "npx tsc --noEmit", "cwd": "../verawallet-fe", "exitCode": 0, "status": "passed", "summary": "Typecheck clean." }
+  ],
+  "adversarialCases": [
+    { "id": "isolated-1to1-link", "scenario": "One bridge_suspected OUT, exactly one eligible IN, that IN eligible for only this OUT.", "expected": "Link both INTERNAL_TRANSFER, one deterministic group_id, OUT dest chain.", "verdict": "passed", "testRef": "links an isolated 1:1 native-ETH bridge" },
+    { "id": "canonical-usdt+spam-rescue", "scenario": "Canonical USDT polygon->eth; destination misflagged SPAM.", "expected": "Linked; destination rescued to INTERNAL_TRANSFER.", "verdict": "passed", "testRef": "links a canonical USDT bridge across chains and rescues a SPAM-misflagged destination" },
+    { "id": "eth-weth-canonical", "scenario": "native ETH out, canonical WETH in.", "expected": "Equivalent, linked.", "verdict": "passed", "testRef": "treats native ETH and canonical WETH as the same asset" },
+    { "id": "spoof-no-link", "scenario": "Destination is a same-symbol token with an unknown (non-canonical) contract.", "expected": "NOT linked; OUT stays SEND (a spoof never erases a disposal).", "verdict": "passed", "testRef": "NEVER links a spoofed same-symbol token" },
+    { "id": "two-out-one-in", "scenario": "Two OUTs both eligible for one IN.", "expected": "Neither links (bidirectional uniqueness).", "verdict": "passed", "testRef": "does NOT link a two-OUT / one-IN ambiguous shape" },
+    { "id": "one-out-two-in", "scenario": "One OUT eligible for two INs.", "expected": "No link.", "verdict": "passed", "testRef": "does NOT link a one-OUT / two-IN ambiguous shape" },
+    { "id": "guards", "scenario": "No candidate / same-chain / out-of-window / out-of-band amount.", "expected": "No link.", "verdict": "passed", "testRef": "does NOT link with no candidate, a same-chain move, an out-of-window IN, or an out-of-band amount" },
+    { "id": "exclusions", "scenario": "user_override on OUT or IN; swap group_id.", "expected": "Never touched.", "verdict": "passed", "testRef": "never touches a leg the user manually overrode, and ignores swap-grouped legs" },
+    { "id": "idempotent", "scenario": "Second run.", "expected": "No new writes; same deterministic id.", "verdict": "passed", "testRef": "is idempotent" },
+    { "id": "self-heal-orphan", "scenario": "Mid-pair write failure orphans the pair (OUT linked, IN not).", "expected": "Next run repairs the IN.", "verdict": "passed", "testRef": "self-heals a one-sided (orphaned) link" },
+    { "id": "provider-path", "scenario": "OUT to LI.FI / Across / Stargate registry address.", "expected": "bridge_suspected emitted (the link signal).", "verdict": "passed", "testRef": "indexer.adapters.spec.ts: flags OUT legs routed through each provider as bridge_suspected" }
+  ],
+  "endToEnd": {
+    "surface": "live BE resync + psql (hardened rules)",
+    "evidence": "After reset+resync (208 rows, 0 skips): USDT bridge 0xee478fda linked via canonical contracts (OUT 0xc2132d05 Polygon USDT + IN 0xdac17f958 Ethereum USDT) both INTERNAL_TRANSFER, dest=1, destination rescued from SPAM. ETH bridge 0x798d722 native<->native linked, dest=10. Third OUT 0xf1a2870 (no candidate) stays SEND flagged. Canonical-asset hardening still links the real bridges while a spoof would not."
+  },
+  "verdict": "passed"
+}

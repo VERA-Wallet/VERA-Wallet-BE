@@ -7,11 +7,10 @@ import { TransactionService } from "./transaction.service";
 export class TransactionAvailabilityService implements TransactionAvailabilityPort {
   constructor(private readonly transactions: TransactionService, private readonly indexer: IndexerService) {}
   async listOrSync(userId: string) {
-    let values = await this.transactions.list(userId);
-    if (values.length === 0) {
-      await this.indexer.sync(userId);
-      values = await this.transactions.list(userId);
-    }
-    return values;
+    // Manual-only: perform ONLY the first sync per binding (gated on the initialSyncedAt marker).
+    // Once a binding's first attempt has returned a result it is never re-synced on a read;
+    // new transactions arrive via the manual resync endpoint.
+    await this.indexer.ensureInitialSync(userId);
+    return this.transactions.list(userId);
   }
 }

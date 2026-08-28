@@ -8,3 +8,5 @@ coverage
 apps/backend/node_modules
 packages/*/node_modules
 apps/backend/prisma/dev.db
+
+.gjc/
