@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { BullModule } from "@nestjs/bull";
 import { ConfigService } from "@nestjs/config";
 import { AnchorModule } from "../anchor/anchor.module";
 import { AuthModule } from "../auth/auth.module";
@@ -14,7 +15,7 @@ import { EventReclassificationService } from "./event-reclassification.service";
 import { AnchorProofService } from "./anchor-proof.service";
 import { TransactionService } from "./transaction.service";
 import { TransactionAvailabilityService } from "./transaction-availability.service";
-import { MockTransactionRepository, PrismaTransactionRepository } from "./transaction.repository.adapters";
+import { CachedTransactionRepository, MockTransactionRepository, PrismaTransactionRepository } from "./transaction.repository.adapters";
 import { MockSyncCursorRepository, PrismaSyncCursorRepository } from "./sync-cursor.repository.adapters";
 import { DexScreenerPriceOracle, MockPriceOracle } from "./price-oracle";
 import { PriceEnrichmentService } from "./price-enrichment.service";
@@ -22,10 +23,16 @@ import { CoinGeckoHistoricalPriceOracle, MockHistoricalPriceOracle } from "./his
 import { MockHistoricalPriceRepository, PrismaHistoricalPriceRepository } from "./historical-price.repository.adapters";
 import { HistoricalPriceEnrichmentService } from "./historical-price-enrichment.service";
 import { BridgeLinkingService } from "./bridge-linking.service";
-import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+import { InMemorySyncJobStore } from "./sync-job";
+import { SyncJobRunner, SyncJobService } from "./sync-job.service";
+import { BullSyncDispatcher, InProcessSyncDispatcher, SyncProcessor } from "./sync.queue";
+import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+
+// anchor.module.ts와 같은 스위치: Redis(Bull)는 MOCK_MODE=false에서만 있다.
+const mock = process.env.MOCK_MODE !== "false";
 
 @Module({
-  imports: [AuthModule, SharedModule, AnchorModule, WalletModule],
+  imports: [AuthModule, SharedModule, AnchorModule, WalletModule, ...(mock ? [] : [BullModule.registerQueue({ name: "sync" })])],
   controllers: [IndexerController, FrontendEventQueryController, FrontendEventCommandController, FrontendAnchorProofController],
   providers: [
     MockAlchemyAdapter,
@@ -33,7 +40,8 @@ import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PR
     MockTransactionRepository,
     PrismaTransactionRepository,
     { provide: CHAIN_INDEXER, useFactory: (config: ConfigService, mock: MockAlchemyAdapter, real: AlchemyAdapter) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockAlchemyAdapter, AlchemyAdapter] },
-    { provide: TRANSACTION_REPOSITORY, useFactory: (config: ConfigService, memory: MockTransactionRepository, prisma: PrismaTransactionRepository) => usePrismaPersistence(config) ? prisma : memory, inject: [ConfigService, MockTransactionRepository, PrismaTransactionRepository] },
+    // 읽기 경로는 사용자별 스냅샷 캐시를 지난다. 쓰기(save·updatePayload)도 같은 인스턴스를 지나므로 캐시가 쓰기를 놓치지 않는다.
+    { provide: TRANSACTION_REPOSITORY, useFactory: (config: ConfigService, memory: MockTransactionRepository, prisma: PrismaTransactionRepository) => new CachedTransactionRepository(usePrismaPersistence(config) ? prisma : memory), inject: [ConfigService, MockTransactionRepository, PrismaTransactionRepository] },
     { provide: TRANSACTION_SYNC_REPOSITORY, useExisting: TRANSACTION_REPOSITORY },
     MockSyncCursorRepository,
     PrismaSyncCursorRepository,
@@ -43,7 +51,17 @@ import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PR
     { provide: PRICE_ORACLE, useFactory: (config: ConfigService, mock: MockPriceOracle, real: DexScreenerPriceOracle) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockPriceOracle, DexScreenerPriceOracle] },
     PriceEnrichmentService,
     MockHistoricalPriceOracle,
-    { provide: CoinGeckoHistoricalPriceOracle, useFactory: (config: ConfigService) => new CoinGeckoHistoricalPriceOracle(config.get<string>("COINGECKO_API_KEY") || null), inject: [ConfigService] },
+    {
+      provide: CoinGeckoHistoricalPriceOracle,
+      useFactory: (config: ConfigService) => {
+        // Demo 플랜의 과거 조회 창은 365일(historical-price-oracle.ts DEMO_HISTORY_WINDOW_DAYS). 유료면 0(무제한).
+        const raw = config.get<string>("COINGECKO_HISTORY_DAYS");
+        const configured = Number(raw);
+        const historyWindowDays = raw !== undefined && Number.isFinite(configured) && configured >= 0 ? configured : 365;
+        return new CoinGeckoHistoricalPriceOracle(config.get<string>("COINGECKO_API_KEY") || null, historyWindowDays);
+      },
+      inject: [ConfigService],
+    },
     { provide: HISTORICAL_PRICE_ORACLE, useFactory: (config: ConfigService, mock: MockHistoricalPriceOracle, real: CoinGeckoHistoricalPriceOracle) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockHistoricalPriceOracle, CoinGeckoHistoricalPriceOracle] },
     MockHistoricalPriceRepository,
     PrismaHistoricalPriceRepository,
@@ -51,6 +69,13 @@ import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PR
     HistoricalPriceEnrichmentService,
     BridgeLinkingService,
     IndexerService,
+    InMemorySyncJobStore,
+    { provide: SYNC_JOB_STORE, useExisting: InMemorySyncJobStore },
+    SyncJobRunner,
+    SyncJobService,
+    ...(mock
+      ? [{ provide: SYNC_DISPATCHER, useClass: InProcessSyncDispatcher }]
+      : [BullSyncDispatcher, SyncProcessor, { provide: SYNC_DISPATCHER, useExisting: BullSyncDispatcher }]),
     TransactionService,
     TransactionAvailabilityService,
     { provide: TRANSACTION_AVAILABILITY, useExisting: TransactionAvailabilityService },

@@ -49,12 +49,33 @@ export class IndexerService {
     return this.coalesce(userId, "all", () => this.runSync(userId, bindings));
   }
 
-  /** Read-path first sync: syncs ONLY bindings that have never completed a first attempt. No-op once done. */
-  async ensureInitialSync(userId: string): Promise<void> {
+  /**
+   * Read-path first sync: syncs ONLY bindings that have never completed a first attempt. No-op once done.
+   *
+   * `waitMs` bounds how long a READ waits for that first sync. A heavy wallet's first sync runs for minutes
+   * (thousands of transfers + historical prices), and a read that blocks on it just trips the FE's 5s
+   * upstream timeout — the dashboard and tax page 502 for the whole duration. Past the bound the read
+   * returns whatever is stored (stale-until-refresh) while the sync keeps running; the import modal polls
+   * the job for completion. Without `waitMs` the call waits for the sync to settle (mock/e2e paths).
+   */
+  async ensureInitialSync(userId: string, options: { waitMs?: number } = {}): Promise<void> {
     const bindings = await this.wallets.findAllByUser(userId);
     const incomplete = bindings.filter((binding) => binding.initialSyncedAt === null);
     if (incomplete.length === 0) return;
-    await this.coalesce(userId, "subset", () => this.runSync(userId, incomplete));
+    const run = this.coalesce(userId, "subset", () => this.runSync(userId, incomplete));
+    if (options.waitMs === undefined) {
+      await run;
+      return;
+    }
+    let timer: NodeJS.Timeout | undefined;
+    const timeout = new Promise<"timeout">((resolve) => { timer = setTimeout(() => resolve("timeout"), options.waitMs); });
+    try {
+      const outcome = await Promise.race([run.then(() => "settled" as const), timeout]);
+      // Settled within the bound: surface the sync's own failure exactly as before (e.g. total outage -> 503).
+      if (outcome === "timeout") run.catch(() => undefined); // still running; its rejection is reported via the job/skips, not this read
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private coalesce(userId: string, mode: SyncMode, work: () => Promise<SyncResult>): Promise<SyncResult> {

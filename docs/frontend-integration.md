@@ -352,7 +352,7 @@ POST /api/auth/logout
 GET /api/events?cursor=<event-id>&limit=20&includeSpam=false
 ```
 
-- `limit`: 기본 20, 최소 1, 최대 100
+- `limit`: 기본 20, 최소 1, 최대 1000(2026-09-08부터. 이전 100)
 - `cursor`: 마지막으로 받은 event ID
 - `includeSpam`: 기본 `false`. 스팸/에어드랍 더스트(`classification: "SPAM"`)는 기본 목록에서 숨겨집니다. `true`로 요청하면 숨김 항목까지 노출되어 오탐을 `PATCH /api/events/:id`로 다시 실제 분류로 되돌릴 수 있습니다.
 
@@ -488,13 +488,20 @@ type AnchorProof = {
 동기화 모델은 **수동 전용**입니다. 대시보드 최초 진입 시 바인딩별로 **한 번만** 최초 동기화가 자동 실행되고(그 순간 `initialSyncedAt` 마커가 기록됨), 그 이후로는 읽기(`GET /api/events`, `/api/events/summary`)가 **다시는 자동 동기화하지 않습니다**. 새 온체인 거래를 가져오려면 사용자가 아래 엔드포인트를 호출해야 합니다(예: "새로고침" 버튼).
 
 ```http
-POST /api/events/resync
+POST /api/events/resync            → 202 { jobId, status: "queued" | "running" | "done" | "failed" }
+GET  /api/events/resync/:jobId     → 200 { jobId, status, result?, error? }
 ```
 
 - 인증: JWT 쿠키(`vw_access_token`).
-- 동작: 사용자의 **모든** 바인딩 지갑을 대상으로 강제 증분 동기화(체인별 `fromBlock=커서`..`toBlock=현재 head`). 최초 sync 이후 저장된 커서 이후의 새 블록만 가져오므로 전체 히스토리를 다시 긁지 않습니다.
-- 응답: `success({ bindings, fetched, normalized, chains, skipped })`. `chains`는 지원 체인 전체를 항상 포함하는 체인별 수집 건수 배열 `{ chainId: number; fetched: number }[]`입니다(0 허용, 레지스트리 순서 `[1, 8453, 42161, 10, 137]`) — 불러오기 모달이 이 한 응답으로 체인별 완료 상태를 그릴 수 있습니다. `skipped`는 JSON-safe 진단 배열 `{ bindingId: string; chainId?: number; code: string; message?: string }`입니다(예: `chain_incomplete`, `binding_unavailable`, `anchor_enqueue_failed`). 모든 바인딩이 관측 불가면 `503`.
+- **비동기 작업입니다(2026-09-08부터).** 지갑 하나의 최초 동기화도 체인 5개 수집과 과거 시세 조회 때문에 수십 초가 걸려, 동기 응답은 프록시·브라우저 타임아웃(Next 외부 rewrite 기본 30초)에 먼저 끊겼습니다. `POST`는 작업을 받았다는 사실만 `202`로 돌려주고, FE는 `GET /api/events/resync/:jobId`를 1초 간격으로 폴링해 `done`/`failed`를 봅니다.
+- 동작: 사용자의 **모든** 바인딩 지갑을 대상으로 강제 증분 동기화(체인별 `fromBlock=커서`..`toBlock=현재 head`). 최초 sync 이후 저장된 커서 이후의 새 블록만 가져오므로 전체 히스토리를 다시 긁지 않습니다. 체인 5개는 동시 3개까지 병렬로 훑고, Alchemy 429는 Retry-After·지수 백오프로 최대 3회 재시도합니다.
+- `POST` 응답의 `data`: `{ jobId: string; status; createdAt; updatedAt }`. 지갑이 하나도 없으면 작업을 만들지 않고 즉시 `404`(`bound wallet`)입니다. 같은 사용자의 작업이 아직 `queued`/`running`이면 새로 만들지 않고 그 작업을 돌려줍니다(새로고침 연타 방어).
+- `GET` 응답의 `data`: 위 필드에 더해 `done`이면 `result`, `failed`면 `error: { code, message }`. 남의 작업이나 모르는 id는 `404`입니다. 작업 상태는 BE 프로세스 메모리에만 있어 **BE가 재시작되면 진행 중이던 작업은 404가 됩니다** — FE는 이를 실패로 보고 "다시 시도"를 줍니다.
+- `result`: `{ bindings, fetched, normalized, chains, skipped }`. `chains`는 지원 체인 전체를 항상 포함하는 체인별 수집 건수 배열 `{ chainId: number; fetched: number }[]`입니다(0 허용, 레지스트리 순서 `[1, 8453, 42161, 10, 137]`) — 불러오기 모달이 이 한 응답으로 체인별 완료 상태를 그릴 수 있습니다. `skipped`는 JSON-safe 진단 배열 `{ bindingId: string; chainId?: number; code: string; message?: string }`입니다(예: `chain_incomplete`, `binding_unavailable`, `anchor_enqueue_failed`).
+- `error.code`: 모든 바인딩이 관측 불가면 `sync_unavailable`(구 503), 큐에 넣지 못하면 `enqueue_failed`, 그 밖의 예외는 `sync_failed`.
+- 실행 방식은 anchor 큐와 같은 스위치를 탑니다. `MOCK_MODE=true`면 프로세스 안에서 다음 틱에 실행, `MOCK_MODE=false`면 Redis(Bull) `sync` 큐에서 동시성 1로 실행합니다(사용자들의 동기화가 한 번에 하나씩 돌아 Alchemy 예산을 나눠 씁니다).
 - **stale-until-refresh**: 이 호출 전까지 목록은 마지막 동기화 시점의 상태를 보여줍니다. 자동 백그라운드/주기 동기화는 후속 과제입니다.
+- 레거시 `POST /indexer/sync`(코어 API)는 여전히 동기 응답입니다.
 
 프록시: 이 경로는 기존 `/api/events/*` allowlist 와일드카드로 프록시됩니다(재분류 `PATCH /api/events/:id`와 동일). FE 프록시가 **POST를 쿠키·바디와 함께 전달**하는지 확인하세요(현재 PATCH가 그렇게 동작). 최소 FE 트리거("새로고침" 버튼)는 FE 레포 후속 작업입니다.
 

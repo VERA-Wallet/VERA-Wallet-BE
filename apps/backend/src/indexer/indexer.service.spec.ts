@@ -134,6 +134,32 @@ describe("IndexerService coalescing", () => {
   });
 });
 
+describe("IndexerService read-gate bounded wait", () => {
+  it("returns a read within waitMs while a slow first sync keeps running, then completes it", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const h = await harness(async () => { await gate; return { transactions: [], chainHeads: { ...ALL_HEADS } }; });
+    const binding = await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+
+    const started = Date.now();
+    await h.service.ensureInitialSync("u1", { waitMs: 20 });
+    expect(Date.now() - started).toBeLessThan(1_000);
+    expect((await h.wallets.findAllByUser("u1"))[0].initialSyncedAt).toBeNull(); // still running
+
+    release();
+    // A later read (subset) rides the still-in-flight run instead of starting another provider call.
+    await h.service.ensureInitialSync("u1");
+    expect((await h.wallets.findAllByUser("u1")).find((b) => b.id === binding.id)?.initialSyncedAt).not.toBeNull();
+    expect(h.indexerFn).toHaveBeenCalledTimes(1);
+  });
+
+  it("still surfaces a total-outage failure when the sync settles inside the bound", async () => {
+    const h = await harness(async () => { throw new Error("provider down"); });
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    await expect(h.service.ensureInitialSync("u1", { waitMs: 1_000 })).rejects.toBeInstanceOf(ServiceUnavailableException);
+  });
+});
+
 describe("IndexerService per-event anchor isolation (AC8)", () => {
   it("an event-1 enqueue rejection does not stop event-2; event 1 is left failed; cursor/marker still advance", async () => {
     const h = await harness(async () => ({ transactions: [evt(0), evt(1)], chainHeads: { ...ALL_HEADS } }));

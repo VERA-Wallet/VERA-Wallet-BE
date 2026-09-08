@@ -115,3 +115,25 @@ describe("MockHistoricalPriceOracle", () => {
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
+
+describe("CoinGeckoHistoricalPriceOracle plan history window", () => {
+  it("does not spend a request on a day older than the plan window, and asks inside it", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ prices: [[Date.UTC(2026, 8, 1, 12), 1000]] }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const now = () => new Date("2026-09-08T00:00:00.000Z");
+    const oracle = new CoinGeckoHistoricalPriceOracle("key", 365, now);
+    await expect(oracle.priceAt(1, null, "NATIVE", "2025-06-01")).resolves.toBeNull();
+    expect(fetchMock).not.toHaveBeenCalled();
+    await expect(oracle.priceAt(1, null, "NATIVE", "2026-09-01")).resolves.toEqual({ krw: "1000", status: "RESOLVED" });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    vi.unstubAllGlobals();
+  });
+
+  it("treats 0 as unlimited (paid plan)", async () => {
+    const fetchMock = vi.fn(async () => ({ ok: true, status: 200, json: async () => ({ prices: [[Date.UTC(2021, 0, 1, 12), 5]] }) }));
+    vi.stubGlobal("fetch", fetchMock);
+    const oracle = new CoinGeckoHistoricalPriceOracle("key", 0, () => new Date("2026-09-08T00:00:00.000Z"));
+    await expect(oracle.priceAt(1, null, "NATIVE", "2021-01-01")).resolves.toEqual({ krw: "5", status: "RESOLVED" });
+    vi.unstubAllGlobals();
+  });
+});

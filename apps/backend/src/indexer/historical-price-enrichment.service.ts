@@ -16,6 +16,10 @@ function isFinitePositive(raw: string): boolean {
   }
 }
 
+// An unlisted asset is re-checked after this long — listings do appear over time, so the memory is not permanent.
+const UNLISTED_TTL_MS = 24 * 60 * 60 * 1_000;
+const UNLISTED_MAX_ENTRIES = 10_000;
+
 // Fills the TAX BASIS (fiat_value + price_status) that the real Alchemy adapter leaves
 // null, using historical KRW closes. Distinct from PriceEnrichmentService, which only
 // writes the display-only DexScreener spot price and never touches the basis.
@@ -30,6 +34,11 @@ export class HistoricalPriceEnrichmentService {
   // same popular token+day) share ONE oracle lookup per (chain, assetKey, date). Entries
   // are deleted once settled, so a failed lookup stays retryable (never permanently null).
   private readonly inflight = new Map<string, Promise<string | null>>();
+  // Assets the provider positively does not list (404), keyed by chain:asset, with an expiry.
+  // Without this every resync re-asks CoinGecko for every (unlisted asset, day) pair — on a wallet with
+  // hundreds of long-tail tokens that alone burns the free-tier quota (~30 calls/min) for an hour.
+  // Only UNLISTED is remembered; transient failures (429/network) stay retryable as before.
+  private readonly unlisted = new Map<string, number>();
 
   constructor(
     @Inject(HISTORICAL_PRICE_ORACLE) private readonly oracle: HistoricalPriceOracle,
@@ -42,6 +51,12 @@ export class HistoricalPriceEnrichmentService {
       const payload = transaction.payload;
       // Already-priced rows (e.g. the mock path) keep their basis untouched.
       if (payload.fiat_value !== null && payload.fiat_value !== undefined) continue;
+      // Dust/airdrop spam is excluded from tax and hidden by default; pricing it only spends provider quota.
+      // A heavy wallet is mostly spam by row count (3,000+ inbound airdrops observed on 2026-09-08).
+      if (payload.classification === "SPAM") {
+        payload.price_status = "UNKNOWN";
+        continue;
+      }
 
       // Every row we take ownership of is UNKNOWN until a validated close resolves it.
       // This makes the invariant self-contained instead of trusting an upstream default.
@@ -64,7 +79,7 @@ export class HistoricalPriceEnrichmentService {
 
       let unitKrw = memo.get(memoKey);
       if (unitKrw === undefined) {
-        unitKrw = await this.resolveShared(memoKey, chainId, assetKey, contract, assetType, date);
+        unitKrw = this.isUnlisted(chainId, assetKey) ? null : await this.resolveShared(memoKey, chainId, assetKey, contract, assetType, date);
         memo.set(memoKey, unitKrw);
       }
       if (unitKrw === null) continue; // UNKNOWN: never coerce a basis
@@ -100,6 +115,10 @@ export class HistoricalPriceEnrichmentService {
       const cached = await this.cache.get(chainId, assetKey, date);
       if (cached !== null && isFinitePositive(cached)) return cached;
       const looked = await this.oracle.priceAt(chainId, contract, assetType, date);
+      if (looked !== null && looked.status === "UNLISTED") {
+        this.rememberUnlisted(chainId, assetKey);
+        return null;
+      }
       if (looked === null || !isFinitePositive(looked.krw)) return null; // never cache poison
       await this.cache.put({ chainId, assetKey, date, krw: looked.krw });
       // Consume the CANONICAL persisted close: under a concurrent miss ON CONFLICT DO NOTHING
@@ -110,6 +129,22 @@ export class HistoricalPriceEnrichmentService {
       this.logger.warn(`Historical price resolve failed for ${chainId}:${assetKey}@${date}: ${(error as Error).message}`);
       return null;
     }
+  }
+
+  private isUnlisted(chainId: number, assetKey: string): boolean {
+    const expiresAt = this.unlisted.get(`${chainId}:${assetKey}`);
+    if (expiresAt === undefined) return false;
+    if (expiresAt > Date.now()) return true;
+    this.unlisted.delete(`${chainId}:${assetKey}`);
+    return false;
+  }
+
+  private rememberUnlisted(chainId: number, assetKey: string): void {
+    if (this.unlisted.size >= UNLISTED_MAX_ENTRIES) {
+      const oldest = this.unlisted.keys().next().value;
+      if (oldest !== undefined) this.unlisted.delete(oldest);
+    }
+    this.unlisted.set(`${chainId}:${assetKey}`, Date.now() + UNLISTED_TTL_MS);
   }
 
   private quantityOf(payload: Record<string, unknown>): Decimal | null {
