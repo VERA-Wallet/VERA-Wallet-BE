@@ -203,3 +203,36 @@ describe("HistoricalPriceEnrichmentService.enrich", () => {
     expect(t.payload.price_status).toBe("UNKNOWN");
   });
 });
+
+describe("HistoricalPriceEnrichmentService quota guards", () => {
+  it("never prices SPAM rows — they are excluded from tax and would only spend provider quota", async () => {
+    const spam = tx({ classification: "SPAM", price_status: "RESOLVED" });
+    const { oracle, calls } = countingOracle({ krw: "1000000", status: "RESOLVED" });
+    await new HistoricalPriceEnrichmentService(oracle, new MockHistoricalPriceRepository()).enrich([spam]);
+    expect(calls()).toBe(0);
+    expect(spam.payload.fiat_value).toBeNull();
+    expect(spam.payload.price_status).toBe("UNKNOWN");
+  });
+
+  it("remembers an UNLISTED asset and stops asking for other days of the same asset", async () => {
+    let calls = 0;
+    const oracle: HistoricalPriceOracle = { priceAt: async () => { calls += 1; return { status: "UNLISTED" }; } };
+    const service = new HistoricalPriceEnrichmentService(oracle, new MockHistoricalPriceRepository());
+    await service.enrich([tx({}), tx({ block_timestamp: "2025-01-04T12:00:00.000Z" })]);
+    expect(calls).toBe(1); // second day of the same asset is answered from the negative memory
+    // A later sync of the same asset is also answered without the provider.
+    const later = tx({ block_timestamp: "2025-02-01T12:00:00.000Z" });
+    await service.enrich([later]);
+    expect(calls).toBe(1);
+    expect(later.payload.price_status).toBe("UNKNOWN");
+  });
+
+  it("does not remember a transient null — the next sync asks again", async () => {
+    let calls = 0;
+    const oracle: HistoricalPriceOracle = { priceAt: async () => { calls += 1; return null; } };
+    const service = new HistoricalPriceEnrichmentService(oracle, new MockHistoricalPriceRepository());
+    await service.enrich([tx({})]);
+    await service.enrich([tx({})]);
+    expect(calls).toBe(2);
+  });
+});

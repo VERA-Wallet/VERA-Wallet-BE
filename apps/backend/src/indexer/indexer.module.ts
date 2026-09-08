@@ -50,7 +50,17 @@ const mock = process.env.MOCK_MODE !== "false";
     { provide: PRICE_ORACLE, useFactory: (config: ConfigService, mock: MockPriceOracle, real: DexScreenerPriceOracle) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockPriceOracle, DexScreenerPriceOracle] },
     PriceEnrichmentService,
     MockHistoricalPriceOracle,
-    { provide: CoinGeckoHistoricalPriceOracle, useFactory: (config: ConfigService) => new CoinGeckoHistoricalPriceOracle(config.get<string>("COINGECKO_API_KEY") || null), inject: [ConfigService] },
+    {
+      provide: CoinGeckoHistoricalPriceOracle,
+      useFactory: (config: ConfigService) => {
+        // Demo 플랜의 과거 조회 창은 365일(historical-price-oracle.ts DEMO_HISTORY_WINDOW_DAYS). 유료면 0(무제한).
+        const raw = config.get<string>("COINGECKO_HISTORY_DAYS");
+        const configured = Number(raw);
+        const historyWindowDays = raw !== undefined && Number.isFinite(configured) && configured >= 0 ? configured : 365;
+        return new CoinGeckoHistoricalPriceOracle(config.get<string>("COINGECKO_API_KEY") || null, historyWindowDays);
+      },
+      inject: [ConfigService],
+    },
     { provide: HISTORICAL_PRICE_ORACLE, useFactory: (config: ConfigService, mock: MockHistoricalPriceOracle, real: CoinGeckoHistoricalPriceOracle) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockHistoricalPriceOracle, CoinGeckoHistoricalPriceOracle] },
     MockHistoricalPriceRepository,
     PrismaHistoricalPriceRepository,

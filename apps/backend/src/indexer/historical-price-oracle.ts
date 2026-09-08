@@ -9,10 +9,14 @@ import { Injectable, Logger } from "@nestjs/common";
 // price could NOT be resolved (unsupported chain/asset, network/HTTP/parse failure) —
 // the basis stays UNKNOWN and MUST NEVER be coerced to 0 or treated as spam.
 export type HistoricalPrice = { krw: string; status: "RESOLVED" };
+// The provider positively does not know this asset (404). Unlike a transient null this is a
+// durable fact for the asset (not just the day), so callers may stop asking for a while.
+export type HistoricalPriceUnlisted = { status: "UNLISTED" };
+export type HistoricalLookup = HistoricalPrice | HistoricalPriceUnlisted | null;
 
 export interface HistoricalPriceOracle {
   // `date` is a UTC calendar day, YYYY-MM-DD. `contract` is null for the native coin.
-  priceAt(chainId: number, contract: string | null, assetType: string, date: string): Promise<HistoricalPrice | null>;
+  priceAt(chainId: number, contract: string | null, assetType: string, date: string): Promise<HistoricalLookup>;
 }
 
 // chainId -> CoinGecko ids. `platform` addresses ERC20 contracts on that chain;
@@ -32,16 +36,39 @@ const CHAIN_COINGECKO: Record<number, ChainCoingecko> = {
 // Requires a free CoinGecko Demo API key (`x-cg-demo-api-key`). Without a key the endpoint
 // is skipped entirely: the keyless public tier is now unreliable (401/429) and hammering
 // it would only produce UNKNOWN with wasted latency, so no key -> immediate UNKNOWN.
+// The Demo tier answers 401 "exceeds the allowed time range" for anything older than this many days.
+// Asking anyway burns quota on every resync for every (asset, day) pair outside the window — a wallet with
+// 2021-2024 history re-asks ~800 times per sync for answers that are known to be denied.
+export const DEMO_HISTORY_WINDOW_DAYS = 365;
+
 @Injectable()
 export class CoinGeckoHistoricalPriceOracle implements HistoricalPriceOracle {
   private readonly logger = new Logger(CoinGeckoHistoricalPriceOracle.name);
   private readonly base = "https://api.coingecko.com/api/v3";
+  private warnedOutOfRange = false;
 
-  constructor(private readonly apiKey: string | null = null) {}
+  /**
+   * @param historyWindowDays how far back the plan may query. 0 = unlimited. Dates outside the window are
+   *   UNKNOWN without a request. The module factory passes COINGECKO_HISTORY_DAYS (Demo default 365); direct
+   *   construction defaults to unlimited so specs that pin fixed past dates keep exercising the request path.
+   * @param now injectable clock for tests.
+   */
+  constructor(
+    private readonly apiKey: string | null = null,
+    private readonly historyWindowDays: number = 0,
+    private readonly now: () => Date = () => new Date(),
+  ) {}
 
-  async priceAt(chainId: number, contract: string | null, assetType: string, date: string): Promise<HistoricalPrice | null> {
+  async priceAt(chainId: number, contract: string | null, assetType: string, date: string): Promise<HistoricalLookup> {
     // No Demo key configured -> the tax basis stays UNKNOWN (never a fabricated 0).
     if (!this.apiKey) return null;
+    if (this.outsideHistoryWindow(date)) {
+      if (!this.warnedOutOfRange) {
+        this.warnedOutOfRange = true;
+        this.logger.warn(`CoinGecko plan window is ${this.historyWindowDays} days; older days (e.g. ${date}) stay UNKNOWN without a request. Set COINGECKO_HISTORY_DAYS=0 on a paid plan.`);
+      }
+      return null;
+    }
     // Whitelist: only the native coin (null contract) or an ERC20 with a real contract is
     // fungibly priceable. NFTs and any other/unknown kind are UNKNOWN (null), never routed
     // to a mismatched endpoint.
@@ -60,7 +87,10 @@ export class CoinGeckoHistoricalPriceOracle implements HistoricalPriceOracle {
 
     try {
       const response = await fetch(url, { headers: { accept: "application/json", "x-cg-demo-api-key": this.apiKey } });
-      if (!response.ok) return null; // transient/unsupported, never a confirmed zero
+      // 404 = CoinGecko has no listing for this contract/coin at all. Long-tail and airdrop tokens hit this on
+      // every (asset, day) pair; surfacing it lets the enrichment stop re-asking for the same asset each sync.
+      if (response.status === 404) return { status: "UNLISTED" };
+      if (!response.ok) return null; // transient (429/5xx), never a confirmed zero
       const body = (await response.json()) as { prices?: unknown };
       const krw = summarizeDailyClose(body.prices, window.from, window.to);
       return krw === null ? null : { krw, status: "RESOLVED" };
@@ -69,7 +99,16 @@ export class CoinGeckoHistoricalPriceOracle implements HistoricalPriceOracle {
       return null;
     }
   }
+
+  private outsideHistoryWindow(date: string): boolean {
+    if (!(this.historyWindowDays > 0)) return false;
+    const window = dayWindow(date);
+    if (!window) return false; // malformed dates are rejected by the caller's own dayWindow check
+    const oldestAllowedSec = Math.floor(this.now().getTime() / 1000) - this.historyWindowDays * 86_400;
+    return window.to <= oldestAllowedSec;
+  }
 }
+
 
 // "NATIVE + null contract" -> native coin endpoint; "ERC20 + non-empty contract" ->
 // contract endpoint; everything else (NFT, unknown kind, NATIVE-with-contract, ERC20
@@ -122,7 +161,7 @@ export function summarizeDailyClose(prices: unknown, fromSec: number, toSec: num
 // basis and never touches the network.
 @Injectable()
 export class MockHistoricalPriceOracle implements HistoricalPriceOracle {
-  async priceAt(): Promise<HistoricalPrice | null> {
+  async priceAt(): Promise<HistoricalLookup> {
     return null;
   }
 }
