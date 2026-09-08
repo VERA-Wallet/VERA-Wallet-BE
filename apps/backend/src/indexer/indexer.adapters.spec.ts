@@ -78,14 +78,15 @@ const nativeIn = (hash: string, log = 0, value = "0x0de0b6b3a7640000") => ({
 
 const run = async (map: Record<string, Spec[]>, calls: CallRecord[] = [], apiKey: string | undefined = "key") => {
   vi.stubGlobal("fetch", makeFetch(map, calls));
-  const adapter = new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: apiKey }));
+  // 429 retry backoff is real time; keep it negligible so rate-limit tests stay fast.
+  const adapter = new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: apiKey, ALCHEMY_RETRY_BASE_MS: "1" }));
   return (await adapter.fetchTransactions(WALLET)).transactions;
 };
 
 // Full ChainScanResult (for chainHeads / partial-outage assertions).
 const runFull = async (map: Record<string, Spec[]>, calls: CallRecord[] = [], apiKey: string | undefined = "key") => {
   vi.stubGlobal("fetch", makeFetch(map, calls));
-  return new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: apiKey })).fetchTransactions(WALLET, undefined);
+  return new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: apiKey, ALCHEMY_RETRY_BASE_MS: "1" })).fetchTransactions(WALLET, undefined);
 };
 
 afterEach(() => vi.unstubAllGlobals());
@@ -856,5 +857,59 @@ describe("AlchemyAdapter bridge suspicion (conservative flag-only)", () => {
       expect(event.payload.bridge_suspected, name).toBe(true);
       expect(event.payload.confidence as number).toBeLessThan(0.5);
     }
+  });
+});
+
+describe("AlchemyAdapter bounded parallel fan-out", () => {
+  it("scans chains concurrently (bounded) but returns transactions in registry order", async () => {
+    const calls: CallRecord[] = [];
+    const tx = (hexDigit: string) => nativeIn("0x" + hexDigit.repeat(64));
+    const out = await run({
+      "eth-mainnet:in": [{ transfers: [tx("1")] }],
+      "base-mainnet:in": [{ transfers: [tx("2")] }],
+      "arb-mainnet:in": [{ transfers: [tx("3")] }],
+      "opt-mainnet:in": [{ transfers: [tx("4")] }],
+      "polygon-mainnet:in": [{ transfers: [tx("5")] }],
+    }, calls);
+    expect(out.map((t) => t.payload.chain_id)).toEqual([1, 8453, 42161, 10, 137]);
+    // Every chain still scanned both directions exactly once.
+    expect(calls).toHaveLength(10);
+  });
+
+  it("keeps in-flight chains bounded so a shared CU budget is not burst by five hosts at once", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    vi.stubGlobal("fetch", vi.fn(async (_url: string, init: any) => {
+      const body = JSON.parse(init.body);
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      inFlight -= 1;
+      if (body.method === "eth_blockNumber") return { ok: true, status: 200, json: async () => ({ result: "0xf4240" }) };
+      return { ok: true, status: 200, json: async () => ({ result: { transfers: [] } }) };
+    }));
+    await new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: "key" })).fetchTransactions(WALLET);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+  });
+
+  it("retries a 429 with backoff and succeeds when the limiter clears", async () => {
+    const attempts: Record<string, number> = {};
+    vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
+      const body = JSON.parse(init.body);
+      if (body.method === "eth_blockNumber") return { ok: true, status: 200, json: async () => ({ result: "0xf4240" }) };
+      const network = /https:\/\/([^.]+)\.g\.alchemy\.com/.exec(url)?.[1] ?? "";
+      const key = `${network}:${body.params[0].toAddress ? "in" : "out"}`;
+      attempts[key] = (attempts[key] ?? 0) + 1;
+      if (key === "eth-mainnet:in" && attempts[key] === 1) {
+        return { ok: false, status: 429, headers: { get: () => null }, json: async () => ({}) };
+      }
+      const transfers = key === "eth-mainnet:in" ? [nativeIn("0x" + "a".repeat(64))] : [];
+      return { ok: true, status: 200, json: async () => ({ result: { transfers } }) };
+    }));
+    const out = await new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: "key", ALCHEMY_RETRY_BASE_MS: "1" })).fetchTransactions(WALLET);
+    expect(attempts["eth-mainnet:in"]).toBe(2);
+    expect(out.transactions.some((t) => t.payload.chain_id === 1)).toBe(true);
+    expect(out.chainHeads[1]).toBe(0xf4240);
   });
 });

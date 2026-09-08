@@ -6,6 +6,31 @@ import { BRIDGE_REVIEW_CONFIDENCE, isBridgeContract } from "./bridge-registry";
 import { isInboundSpam, type SpamAssetType } from "./spam-filter";
 
 const chains = SUPPORTED_CHAIN_IDS;
+
+// Bounded per-chain fan-out. Alchemy's compute-unit budget is shared across every network host on one key,
+// so a full 5-chain burst can trip 429s; three in flight keeps a zero-delta resync near one round-trip
+// instead of five sequential ones (12.5s -> ~3s observed on 2026-09-08) while staying under the burst.
+const CHAIN_CONCURRENCY = 3;
+// 429 (rate limited) is retried with Retry-After or exponential backoff; other failures are chain-fatal as before.
+const RATE_LIMIT_RETRIES = 3;
+const DEFAULT_RETRY_BASE_MS = 500;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Run `work` over `items` with at most `limit` in flight; results keep the input order. */
+async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) {
+      const index = next;
+      next += 1;
+      results[index] = await work(items[index]);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
 const classifications = ["RECEIVE", "SEND", "EXCHANGE", "INTERNAL_TRANSFER", "UNKNOWN"] as const;
 
 // A detected swap is a strong signal (matched IN/OUT of distinct assets in one tx), so it sits
@@ -135,9 +160,11 @@ export class AlchemyAdapter implements ChainIndexer {
     const chainHeads: Record<number, number> = {};
     let skippedChains = 0;
 
-    // Sequential per-chain fan-out: the CU budget is shared across all hosts, so
-    // concurrent bursts most likely trip 429s.
-    for (const entry of CHAIN_REGISTRY) {
+    // Bounded parallel per-chain fan-out (see CHAIN_CONCURRENCY). Each chain is still scanned
+    // head -> inbound -> outbound in order, so the IN/OUT head-drift guarantee is unchanged.
+    // Outcomes are collected in registry order so callers see the same ordering as before.
+    type ChainOutcome = { entry: ChainRegistryEntry; head: number; transactions: IndexedTransaction[] } | { entry: ChainRegistryEntry; error: Error };
+    const outcomes = await mapWithConcurrency<ChainRegistryEntry, ChainOutcome>(CHAIN_REGISTRY, CHAIN_CONCURRENCY, async (entry) => {
       try {
         const url = `https://${entry.network}.g.alchemy.com/v2/${apiKey}`;
         // Snapshot ONE head before both directions and pass the same toBlock to each,
@@ -152,14 +179,20 @@ export class AlchemyAdapter implements ChainIndexer {
         // any normalization skip inside normalizeChain, withholds the whole chain.
         const inbound = await this.fetchDirection(entry, url, { toAddress: address }, fromBlock, toBlock);
         const outbound = await this.fetchDirection(entry, url, { fromAddress: address }, fromBlock, toBlock);
-        const chainTxs = this.normalizeChain(entry, address, wallet, inbound, outbound);
-        results.push(...chainTxs);
-        // Complete observation: record the scanned head even when zero transfers returned.
-        chainHeads[entry.chainId] = head;
+        return { entry, head, transactions: this.normalizeChain(entry, address, wallet, inbound, outbound) };
       } catch (error) {
-        skippedChains += 1;
-        this.logger.warn(`Skipping chain ${entry.chainId} (${entry.network}): ${(error as Error).message}`);
+        return { entry, error: error as Error };
       }
+    });
+    for (const outcome of outcomes) {
+      if ("error" in outcome) {
+        skippedChains += 1;
+        this.logger.warn(`Skipping chain ${outcome.entry.chainId} (${outcome.entry.network}): ${outcome.error.message}`);
+        continue;
+      }
+      results.push(...outcome.transactions);
+      // Complete observation: record the scanned head even when zero transfers returned.
+      chainHeads[outcome.entry.chainId] = outcome.head;
     }
 
     // Truthful empty/outage boundary: a result requires at least one completely-observed
@@ -173,13 +206,27 @@ export class AlchemyAdapter implements ChainIndexer {
     return { transactions: results, chainHeads };
   }
 
+  /**
+   * One JSON-RPC POST with rate-limit retry. 429 is the only status retried: it is Alchemy telling us to slow
+   * down, not a broken chain. Retry-After (seconds) wins when present; otherwise exponential backoff from
+   * ALCHEMY_RETRY_BASE_MS (default 500ms). Anything else is returned as-is for the caller's chain-fatal handling.
+   */
+  private async rpcPost(url: string, body: Record<string, unknown>): Promise<Response> {
+    const configured = Number(this.config.get<string>("ALCHEMY_RETRY_BASE_MS"));
+    const baseDelay = Number.isFinite(configured) && configured >= 0 && this.config.get<string>("ALCHEMY_RETRY_BASE_MS") !== undefined ? configured : DEFAULT_RETRY_BASE_MS;
+    for (let attempt = 0; ; attempt += 1) {
+      const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+      if (response.status !== 429 || attempt >= RATE_LIMIT_RETRIES) return response;
+      const retryAfter = Number(response.headers?.get?.("retry-after"));
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : baseDelay * 2 ** attempt;
+      this.logger.warn(`Alchemy rate limited (429); retry ${attempt + 1}/${RATE_LIMIT_RETRIES} in ${delay}ms`);
+      await sleep(delay);
+    }
+  }
+
   // Snapshot the chain head once via eth_blockNumber; validate as a safe non-negative integer.
   private async fetchChainHead(entry: ChainRegistryEntry, url: string): Promise<number> {
-    const response = await fetch(url, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "eth_blockNumber", params: [] }),
-    });
+    const response = await this.rpcPost(url, { id: 1, jsonrpc: "2.0", method: "eth_blockNumber", params: [] });
     if (!response.ok) throw new Error(`${entry.network} head HTTP ${response.status}`);
     const body = (await response.json()) as { error?: { message?: string }; result?: unknown };
     if (body?.error) throw new Error(`${entry.network} head RPC error: ${body.error.message ?? "unknown"}`);
@@ -216,11 +263,7 @@ export class AlchemyAdapter implements ChainIndexer {
       };
       if (pageKey) params.pageKey = pageKey;
 
-      const response = await fetch(url, {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: 1, jsonrpc: "2.0", method: "alchemy_getAssetTransfers", params: [params] }),
-      });
+      const response = await this.rpcPost(url, { id: 1, jsonrpc: "2.0", method: "alchemy_getAssetTransfers", params: [params] });
       if (!response.ok) throw new Error(`${entry.network} HTTP ${response.status}`);
 
       const body = (await response.json()) as { error?: { message?: string }; result?: unknown };
