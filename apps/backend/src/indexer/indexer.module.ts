@@ -1,4 +1,5 @@
 import { Module } from "@nestjs/common";
+import { BullModule } from "@nestjs/bull";
 import { ConfigService } from "@nestjs/config";
 import { AnchorModule } from "../anchor/anchor.module";
 import { AuthModule } from "../auth/auth.module";
@@ -22,10 +23,16 @@ import { CoinGeckoHistoricalPriceOracle, MockHistoricalPriceOracle } from "./his
 import { MockHistoricalPriceRepository, PrismaHistoricalPriceRepository } from "./historical-price.repository.adapters";
 import { HistoricalPriceEnrichmentService } from "./historical-price-enrichment.service";
 import { BridgeLinkingService } from "./bridge-linking.service";
-import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+import { InMemorySyncJobStore } from "./sync-job";
+import { SyncJobRunner, SyncJobService } from "./sync-job.service";
+import { BullSyncDispatcher, InProcessSyncDispatcher, SyncProcessor } from "./sync.queue";
+import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+
+// anchor.module.ts와 같은 스위치: Redis(Bull)는 MOCK_MODE=false에서만 있다.
+const mock = process.env.MOCK_MODE !== "false";
 
 @Module({
-  imports: [AuthModule, SharedModule, AnchorModule, WalletModule],
+  imports: [AuthModule, SharedModule, AnchorModule, WalletModule, ...(mock ? [] : [BullModule.registerQueue({ name: "sync" })])],
   controllers: [IndexerController, FrontendEventQueryController, FrontendEventCommandController, FrontendAnchorProofController],
   providers: [
     MockAlchemyAdapter,
@@ -51,6 +58,13 @@ import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PR
     HistoricalPriceEnrichmentService,
     BridgeLinkingService,
     IndexerService,
+    InMemorySyncJobStore,
+    { provide: SYNC_JOB_STORE, useExisting: InMemorySyncJobStore },
+    SyncJobRunner,
+    SyncJobService,
+    ...(mock
+      ? [{ provide: SYNC_DISPATCHER, useClass: InProcessSyncDispatcher }]
+      : [BullSyncDispatcher, SyncProcessor, { provide: SYNC_DISPATCHER, useExisting: BullSyncDispatcher }]),
     TransactionService,
     TransactionAvailabilityService,
     { provide: TRANSACTION_AVAILABILITY, useExisting: TransactionAvailabilityService },
