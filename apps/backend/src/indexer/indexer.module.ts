@@ -15,7 +15,7 @@ import { EventReclassificationService } from "./event-reclassification.service";
 import { AnchorProofService } from "./anchor-proof.service";
 import { TransactionService } from "./transaction.service";
 import { TransactionAvailabilityService } from "./transaction-availability.service";
-import { MockTransactionRepository, PrismaTransactionRepository } from "./transaction.repository.adapters";
+import { CachedTransactionRepository, MockTransactionRepository, PrismaTransactionRepository } from "./transaction.repository.adapters";
 import { MockSyncCursorRepository, PrismaSyncCursorRepository } from "./sync-cursor.repository.adapters";
 import { DexScreenerPriceOracle, MockPriceOracle } from "./price-oracle";
 import { PriceEnrichmentService } from "./price-enrichment.service";
@@ -40,7 +40,8 @@ const mock = process.env.MOCK_MODE !== "false";
     MockTransactionRepository,
     PrismaTransactionRepository,
     { provide: CHAIN_INDEXER, useFactory: (config: ConfigService, mock: MockAlchemyAdapter, real: AlchemyAdapter) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockAlchemyAdapter, AlchemyAdapter] },
-    { provide: TRANSACTION_REPOSITORY, useFactory: (config: ConfigService, memory: MockTransactionRepository, prisma: PrismaTransactionRepository) => usePrismaPersistence(config) ? prisma : memory, inject: [ConfigService, MockTransactionRepository, PrismaTransactionRepository] },
+    // 읽기 경로는 사용자별 스냅샷 캐시를 지난다. 쓰기(save·updatePayload)도 같은 인스턴스를 지나므로 캐시가 쓰기를 놓치지 않는다.
+    { provide: TRANSACTION_REPOSITORY, useFactory: (config: ConfigService, memory: MockTransactionRepository, prisma: PrismaTransactionRepository) => new CachedTransactionRepository(usePrismaPersistence(config) ? prisma : memory), inject: [ConfigService, MockTransactionRepository, PrismaTransactionRepository] },
     { provide: TRANSACTION_SYNC_REPOSITORY, useExisting: TRANSACTION_REPOSITORY },
     MockSyncCursorRepository,
     PrismaSyncCursorRepository,

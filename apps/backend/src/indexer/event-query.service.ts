@@ -3,11 +3,28 @@ import Decimal from "decimal.js";
 import { computeCostBasis } from "@vera/tax-engine";
 import { TransactionAvailabilityService } from "./transaction-availability.service";
 import { TransactionService } from "./transaction.service";
+import type { TransactionRecord } from "../shared/repository.types";
 import { eventDetail, eventMutation, publicEvent } from "./event.presenter";
+
+// 페이지 상한. 100이면 실지갑(스팸 제외 1,300건)의 대시보드 한 번에 13번 왕복한다. 응답은 건당 ~1KB라 1,000건도 1MB 안팎이다.
+export const MAX_PAGE_LIMIT = 1_000;
 
 @Injectable()
 export class EventQueryService {
+  // 원가 fold는 사용자 전체 이력에 대한 순서 의존 계산이라 페이지마다 다시 돌리면 13페이지에 13번이다.
+  // 저장소 캐시가 같은 배열 인스턴스를 돌려주는 동안은 한 번만 접고 재사용한다(배열이 바뀌면 자연히 다시 계산).
+  private readonly basisBySnapshot = new WeakMap<TransactionRecord[], ReturnType<typeof computeCostBasis>>();
+
   constructor(private readonly available: TransactionAvailabilityService, private readonly transactions: TransactionService) {}
+
+  private basisFor(source: TransactionRecord[]) {
+    let basis = this.basisBySnapshot.get(source);
+    if (!basis) {
+      basis = computeCostBasis(source);
+      this.basisBySnapshot.set(source, basis);
+    }
+    return basis;
+  }
 
   async list(userId: string, cursor?: string, rawLimit?: string, includeSpam = false) {
     // Spam/dust is hidden from the default ledger; a "?includeSpam=true" view exposes
@@ -16,13 +33,13 @@ export class EventQueryService {
     // Cost basis is order-dependent, so it is folded over the user's FULL history (the
     // engine sorts + excludes spam/unknown itself) and merged onto whichever page is shown.
     // Read-time only: nothing here is persisted.
-    const basis = computeCostBasis(source);
+    const basis = this.basisFor(source);
     const visible = includeSpam ? source : source.filter((item) => item.payload.classification !== "SPAM");
     const all = [...visible].sort(
       (a, b) => a.occurredAt.getTime() - b.occurredAt.getTime() || String(a.payload.id).localeCompare(String(b.payload.id)),
     );
     const start = cursor ? Math.max(0, all.findIndex((item) => String(item.payload.id) === cursor) + 1) : 0;
-    const limit = Math.min(100, Math.max(1, Number(rawLimit) || 20));
+    const limit = Math.min(MAX_PAGE_LIMIT, Math.max(1, Number(rawLimit) || 20));
     const items = all.slice(start, start + limit);
     return {
       items: items.map((item) => eventMutation(item, basis.get(String(item.payload.id)))),
@@ -35,7 +52,7 @@ export class EventQueryService {
     if (!transaction) throw new NotFoundException("Event not found.");
     // Fold cost basis over the full user history so the target event's running-average
     // cost / realized P/L match the list view exactly.
-    const basis = computeCostBasis(await this.transactions.list(userId));
+    const basis = this.basisFor(await this.transactions.list(userId));
     return eventDetail(transaction, basis.get(String(transaction.payload.id)));
   }
 

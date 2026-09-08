@@ -352,7 +352,7 @@ POST /api/auth/logout
 GET /api/events?cursor=<event-id>&limit=20&includeSpam=false
 ```
 
-- `limit`: 기본 20, 최소 1, 최대 100
+- `limit`: 기본 20, 최소 1, 최대 1000(2026-09-08부터. 이전 100)
 - `cursor`: 마지막으로 받은 event ID
 - `includeSpam`: 기본 `false`. 스팸/에어드랍 더스트(`classification: "SPAM"`)는 기본 목록에서 숨겨집니다. `true`로 요청하면 숨김 항목까지 노출되어 오탐을 `PATCH /api/events/:id`로 다시 실제 분류로 되돌릴 수 있습니다.
 
