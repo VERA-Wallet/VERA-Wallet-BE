@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { CoinGeckoHistoricalPriceOracle, MockHistoricalPriceOracle, dayWindow, endpointKind, summarizeDailyClose } from "./historical-price-oracle";
+import { CoinGeckoHistoricalPriceOracle, MOCK_NATIVE_CLOSE_KRW, MockHistoricalPriceOracle, dayWindow, endpointKind, summarizeDailyClose } from "./historical-price-oracle";
 
 const DAY = "2025-01-03";
 const w = dayWindow(DAY)!;
@@ -109,10 +109,19 @@ describe("CoinGeckoHistoricalPriceOracle.priceAt", () => {
 });
 
 describe("MockHistoricalPriceOracle", () => {
-  it("always returns null and never touches the network", async () => {
+  it("answers the native coin from a fixed close and never touches the network", async () => {
+    // Mock rows carry a real gas_fee_native, so a null here would make every event in the
+    // default mode report gas_unpriced.
     const fetchMock = vi.spyOn(globalThis, "fetch");
-    expect(await new MockHistoricalPriceOracle().priceAt()).toBeNull();
+    expect(await new MockHistoricalPriceOracle().priceAt(1, null, "NATIVE", "2025-01-03")).toEqual({ krw: MOCK_NATIVE_CLOSE_KRW, status: "RESOLVED" });
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("leaves every other lookup UNKNOWN so the mock path never fabricates a basis", async () => {
+    const oracle = new MockHistoricalPriceOracle();
+    expect(await oracle.priceAt(1, "0xToken", "ERC20", "2025-01-03")).toBeNull();
+    expect(await oracle.priceAt(1, null, "ERC721", "2025-01-03")).toBeNull();
+    expect(await oracle.priceAt(1, "0xToken", "NATIVE", "2025-01-03")).toBeNull(); // NATIVE with a contract is a mismatch
   });
 });
 

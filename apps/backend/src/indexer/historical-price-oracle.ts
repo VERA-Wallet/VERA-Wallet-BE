@@ -157,11 +157,23 @@ export function summarizeDailyClose(prices: unknown, fromSec: number, toSec: num
   return close;
 }
 
-// Test/offline oracle: every lookup is UNKNOWN, so the mock sync path never fills a
-// basis and never touches the network.
+// Obviously-synthetic KRW close for the native coin in MOCK_MODE. Deliberately a round
+// number so nobody mistakes a mock figure for a real one.
+export const MOCK_NATIVE_CLOSE_KRW = "4000000";
+
+// Test/offline oracle. It never touches the network.
+//
+// Contract lookups stay UNKNOWN, so the mock sync path still never fabricates an ERC20
+// basis. The native coin is the deliberate exception: mock rows carry a real
+// `gas_fee_native` ("0.001"), so with no native close every mock event came back
+// gas_unpriced. MOCK_MODE is the default and the contract the frontend develops against,
+// and reporting a fee as unpriceable when the ledger does know it teaches the wrong shape.
+// The basis is unaffected either way, because mock rows already arrive priced.
 @Injectable()
 export class MockHistoricalPriceOracle implements HistoricalPriceOracle {
-  async priceAt(): Promise<HistoricalLookup> {
-    return null;
+  async priceAt(_chainId: number, contract: string | null, assetType: string, _date: string): Promise<HistoricalLookup> {
+    // The same whitelist the real oracle applies, so "native" means exactly one thing.
+    if (endpointKind(assetType, contract) !== "native") return null;
+    return { krw: MOCK_NATIVE_CLOSE_KRW, status: "RESOLVED" };
   }
 }

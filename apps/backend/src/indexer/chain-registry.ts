@@ -25,3 +25,12 @@ export const CHAIN_REGISTRY: readonly ChainRegistryEntry[] = [
 ];
 
 export const SUPPORTED_CHAIN_IDS: readonly number[] = CHAIN_REGISTRY.map((entry) => entry.chainId);
+
+const BY_CHAIN_ID: ReadonlyMap<number, ChainRegistryEntry> = new Map(CHAIN_REGISTRY.map((entry) => [entry.chainId, entry]));
+
+// Native coin symbol for a supported chain, or null for a chain we do not index.
+// Chains that share a symbol (ETH on 1 / 8453 / 42161 / 10) also share one historical
+// close, so a caller can resolve the price once and cache it under every such chain.
+export function nativeSymbolOf(chainId: number): string | null {
+  return BY_CHAIN_ID.get(chainId)?.nativeSymbol ?? null;
+}

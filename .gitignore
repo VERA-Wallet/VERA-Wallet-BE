@@ -10,3 +10,6 @@ packages/*/node_modules
 apps/backend/prisma/dev.db
 
 .gjc/
+# OMC runtime state (any depth). Project-scoped skills under .omc/skills are the committable exception.
+.omc/
+!.omc/skills/

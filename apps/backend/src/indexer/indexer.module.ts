@@ -11,6 +11,7 @@ import { IndexerController } from "./indexer.controller";
 import { FrontendAnchorProofController, FrontendEventCommandController, FrontendEventQueryController } from "./frontend-events.controller";
 import { IndexerService } from "./indexer.service";
 import { EventQueryService } from "./event-query.service";
+import { CostBasisSnapshotService } from "./cost-basis-snapshot.service";
 import { EventReclassificationService } from "./event-reclassification.service";
 import { AnchorProofService } from "./anchor-proof.service";
 import { TransactionService } from "./transaction.service";
@@ -26,7 +27,7 @@ import { BridgeLinkingService } from "./bridge-linking.service";
 import { InMemorySyncJobStore } from "./sync-job";
 import { SyncJobRunner, SyncJobService } from "./sync-job.service";
 import { BullSyncDispatcher, InProcessSyncDispatcher, SyncProcessor } from "./sync.queue";
-import { CHAIN_INDEXER, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+import { CHAIN_INDEXER, COST_BASIS_SNAPSHOT, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
 
 // anchor.module.ts와 같은 스위치: Redis(Bull)는 MOCK_MODE=false에서만 있다.
 const mock = process.env.MOCK_MODE !== "false";
@@ -79,10 +80,12 @@ const mock = process.env.MOCK_MODE !== "false";
     TransactionService,
     TransactionAvailabilityService,
     { provide: TRANSACTION_AVAILABILITY, useExisting: TransactionAvailabilityService },
+    CostBasisSnapshotService,
+    { provide: COST_BASIS_SNAPSHOT, useExisting: CostBasisSnapshotService },
     EventQueryService,
     EventReclassificationService,
     AnchorProofService,
   ],
-  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY],
+  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY, COST_BASIS_SNAPSHOT],
 })
 export class IndexerModule {}

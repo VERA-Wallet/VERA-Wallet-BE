@@ -5,11 +5,17 @@ import type { TransactionRecord } from "../shared/repository.types";
 // so an excluded event (spam/unknown/missing price) carries nulls rather than fabricated
 // numbers; FE reads price_status to explain why. `pnl`/`pnl_ratio` are null for
 // acquisitions (IN) and only populated on disposals (OUT/EXCHANGE).
+//
+// `gas_fee_fiat` is always present (null when the fee could not be valued, or is not
+// attributed to this leg) so FE can bind one stable key. `bridge_move` and `pnl_review`
+// appear only when set, since absence is their normal state.
 function costBasisFields(costBasis: CostBasisResult) {
   return {
     cost_basis: costBasis.excluded ? null : costBasis.costBasis,
     pnl: costBasis.realizedPnl,
     pnl_ratio: costBasis.pnlRatio,
+    gas_fee_fiat: costBasis.gasFiat ?? null,
+    ...(costBasis.bridgeMove ? { bridge_move: costBasis.bridgeMove } : {}),
     ...(costBasis.review ? { pnl_review: costBasis.review } : {}),
   };
 }
