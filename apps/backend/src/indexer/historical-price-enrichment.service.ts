@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from "@nestjs/common";
 import Decimal from "decimal.js";
 import type { IndexedTransaction } from "@vera/interfaces";
+import { nativeSymbolOf } from "./chain-registry";
 import { HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY } from "./indexer.tokens";
 import { dayWindow, endpointKind, type HistoricalPriceOracle } from "./historical-price-oracle";
 import type { HistoricalPriceRepository } from "./historical-price.repository";
@@ -47,8 +48,30 @@ export class HistoricalPriceEnrichmentService {
 
   async enrich(transactions: IndexedTransaction[]): Promise<void> {
     const memo = new Map<string, string | null>();
+    // Every chain this batch touches. One ETH close then serves chains 1/8453/42161/10
+    // (A5): the oracle is asked once and the answer is cached under each of those keys.
+    const batchChainIds = new Set<number>();
+    for (const transaction of transactions) {
+      const chainId = Number(transaction.payload.chain_id);
+      if (Number.isFinite(chainId)) batchChainIds.add(chainId);
+    }
+
     for (const transaction of transactions) {
       const payload = transaction.payload;
+      // Derived BEFORE the early exits below, because the gas fee of a row we do not
+      // price is still paid in the chain's native coin and the read-time cost-basis fold
+      // needs that day's native close. A row skipped for spam / NFT-ness / zero quantity
+      // therefore still warms the cache. Nothing is written to the payload here.
+      const chainId = Number(payload.chain_id);
+      // Fall back on a block_timestamp that will not PARSE, not merely on a missing one.
+      // The read path (cost-basis-snapshot.service.ts) resolves the day this way, and a row
+      // valued on no day here but on occurredAt's day there would price its basis and its
+      // gas from different calendars.
+      const date = this.dateOf(payload.block_timestamp) ?? this.dateOf(transaction.occurredAt);
+      // Principled exception: when neither field yields a day there is nothing to price, so
+      // this row cannot be warmed at all (never guessed from "today").
+      await this.warmNativeClose(chainId, date, batchChainIds, memo);
+
       // Already-priced rows (e.g. the mock path) keep their basis untouched.
       if (payload.fiat_value !== null && payload.fiat_value !== undefined) continue;
       // Dust/airdrop spam is excluded from tax and hidden by default; pricing it only spends provider quota.
@@ -71,8 +94,6 @@ export class HistoricalPriceEnrichmentService {
       const quantity = this.quantityOf(payload);
       if (quantity === null || quantity.lessThanOrEqualTo(0)) continue;
 
-      const chainId = Number(payload.chain_id);
-      const date = this.dateOf(payload.block_timestamp ?? transaction.occurredAt);
       if (!date) continue;
       const assetKey = endpoint === "native" ? "native" : contract!.toLowerCase();
       const memoKey = `${chainId}:${assetKey}:${date}`;
@@ -89,6 +110,42 @@ export class HistoricalPriceEnrichmentService {
       if (!unit.isFinite() || unit.lessThanOrEqualTo(0)) continue;
       payload.fiat_value = unit.mul(quantity).toFixed();
       payload.price_status = "RESOLVED";
+    }
+  }
+
+  // Cache-only warming of the chain's native daily close. The read-time cost-basis fold
+  // needs (chain, day) -> native KRW to value gas fees, but the fee itself is an observed
+  // fact we do NOT store as a derived fiat amount on the payload; this fills the cache the
+  // fold reads from. Nothing here touches `payload`.
+  //
+  // One oracle call per (native symbol, day): the resolved close is written under every
+  // chain in this batch sharing that symbol, so an ETH batch spanning mainnet and Base
+  // costs one lookup and two cache rows.
+  private async warmNativeClose(chainId: number, date: string | null, batchChainIds: ReadonlySet<number>, memo: Map<string, string | null>): Promise<void> {
+    if (date === null || !Number.isFinite(chainId)) return;
+    const symbol = nativeSymbolOf(chainId);
+    if (symbol === null) return; // chain we do not index: no native coin to price
+    const memoKey = `${chainId}:native:${date}`;
+    if (memo.has(memoKey)) return; // already resolved (or already known-unresolvable) in this batch
+
+    const unitKrw = this.isUnlisted(chainId, "native") ? null : await this.resolveShared(memoKey, chainId, "native", null, "NATIVE", date);
+    memo.set(memoKey, unitKrw);
+    if (unitKrw === null) return; // transient/unlisted: stays UNKNOWN, retried next sync
+
+    for (const sibling of batchChainIds) {
+      if (sibling === chainId || nativeSymbolOf(sibling) !== symbol) continue;
+      const siblingKey = `${sibling}:native:${date}`;
+      if (memo.has(siblingKey)) continue;
+      try {
+        await this.cache.put({ chainId: sibling, assetKey: "native", date, krw: unitKrw });
+        // Memoized only AFTER the write lands. Memoizing first would make a failed write
+        // look resolved, so that chain's own rows would short-circuit here and leave it
+        // uncached for the whole batch; instead it retries on its own turn.
+        memo.set(siblingKey, unitKrw);
+      } catch (error) {
+        // A failed sibling write costs one extra lookup; it must never fail the batch.
+        this.logger.warn(`Native close share failed for ${sibling}:native@${date}: ${(error as Error).message}`);
+      }
     }
   }
 
@@ -160,22 +217,29 @@ export class HistoricalPriceEnrichmentService {
     }
   }
 
-  // Reduce a timestamp to its UTC calendar day. Two-step, so it both rejects impossible
-  // dates AND preserves timezone semantics:
-  //   1. the leading YYYY-MM-DD prefix must be a real calendar day (dayWindow round-trip),
-  //      so 2025-02-30T12:00:00Z is rejected instead of normalized into March;
-  //   2. the FULL string must still parse to a real instant (rejects trailing garbage),
-  //      and the returned day is that instant's UTC day, so an offset like +09:00 maps to
-  //      the correct UTC date rather than the raw local prefix.
   private dateOf(value: unknown): string | null {
-    if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
-    if (typeof value === "string") {
-      const trimmed = value.trim();
-      const match = /^(\d{4}-\d{2}-\d{2})/.exec(trimmed);
-      if (!match || dayWindow(match[1]) === null) return null;
-      const ms = Date.parse(trimmed);
-      return Number.isNaN(ms) ? null : new Date(ms).toISOString().slice(0, 10);
-    }
-    return null;
+    return utcDayOf(value);
   }
+}
+
+// Reduce a timestamp to its UTC calendar day. Two-step, so it both rejects impossible
+// dates AND preserves timezone semantics:
+//   1. the leading YYYY-MM-DD prefix must be a real calendar day (dayWindow round-trip),
+//      so 2025-02-30T12:00:00Z is rejected instead of normalized into March;
+//   2. the FULL string must still parse to a real instant (rejects trailing garbage),
+//      and the returned day is that instant's UTC day, so an offset like +09:00 maps to
+//      the correct UTC date rather than the raw local prefix.
+//
+// Exported because the native-price backfill must bucket stored rows into exactly the
+// same days the sync-time warming used; two implementations would drift and re-fetch.
+export function utcDayOf(value: unknown): string | null {
+  if (value instanceof Date) return Number.isNaN(value.getTime()) ? null : value.toISOString().slice(0, 10);
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    const match = /^(\d{4}-\d{2}-\d{2})/.exec(trimmed);
+    if (!match || dayWindow(match[1]) === null) return null;
+    const ms = Date.parse(trimmed);
+    return Number.isNaN(ms) ? null : new Date(ms).toISOString().slice(0, 10);
+  }
+  return null;
 }

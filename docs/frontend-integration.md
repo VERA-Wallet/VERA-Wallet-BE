@@ -399,8 +399,17 @@ type NormalizedEvent = {
   cost_basis: string | null; // IN=취득 총원가, OUT=처분 수량의 인식 원가
   pnl: string | null; // 실현손익. 취득(IN)/제외 이벤트는 null, 처분(OUT/EXCHANGE)만 값
   pnl_ratio: string | null; // pnl / cost_basis (0.5 = +50%). 원가 0이면 null
-  // 처분 수량이 추적 보유분을 초과한 경우에만 존재(초과분은 원가 0으로 인식, 검토 필요).
-  pnl_review?: "disposal_exceeds_holdings";
+  // 가스비의 원화 평가액. 항상 존재하며, 평가 불가(해당 체인·일자 native 종가 미확인)
+  // 이거나 이 leg에 귀속되지 않은 경우 null. 가스는 트랜잭션 단위이므로 스왑 그룹에서는
+  // 한 leg에만 귀속된다(취득 leg 우선). 취득이면 원가에 자본화, 순수 처분이면 처분가에서 차감.
+  gas_fee_fiat: string | null;
+  // 브릿지 페어의 두 leg에만 존재. 원가가 출발 체인에서 도착 체인으로 이동했음을 뜻하며,
+  // 비과세 이동이므로 두 leg 모두 pnl은 null이다. 페어가 아니면 필드가 없다.
+  bridge_move?: "out" | "in";
+  // 검토가 필요한 경우에만 존재. disposal_exceeds_holdings=처분 수량이 추적 보유분 초과
+  // (초과분 원가 0 인식, 기간 합계에서 제외), bridge_move_unmatched=브릿지 페어 불완전,
+  // gas_unpriced=가스는 있으나 native 종가 미확인. 동시 해당 시 앞의 것이 우선한다.
+  pnl_review?: "disposal_exceeds_holdings" | "bridge_move_unmatched" | "gas_unpriced";
   // 스왑 페어링 키(서버 발급). 하나의 스왑을 이루는 처분(OUT/EXCHANGE) leg와
   // 취득(IN/RECEIVE) leg가 동일한 값을 가진다. FE는 이 값이 같은 leg끼리 한 줄로
   // 묶으면 되며, tx_hash나 leg 개수 휴리스틱은 쓰지 않는다. 불투명 문자열로 취급할 것
@@ -458,9 +467,18 @@ GET /api/events/summary?from=2025-01-01T00:00:00.000Z&to=2026-01-01T00:00:00.000
 
 ```ts
 type SummaryDTO = {
+  // 기간 내 처분(OUT)의 실현손익 합. 현금흐름 합계가 아니다(periodPnlBasis 참조).
+  // 취득은 0 기여이고, 취득 원가를 확인할 수 없는 처분은 여기서 빠져 unresolvedProceeds로 간다.
   periodPnl: string;
+  // periodPnl의 산출 근거를 밝히는 상수. 전체 이력을 이동평균법으로 fold한 뒤
+  // 각 처분의 실현손익을 처분 시점 기간에 귀속한다.
+  periodPnlBasis: "realized_moving_average";
+  // 원가 미확인(pnl_review = disposal_exceeds_holdings)으로 periodPnl에서 제외한
+  // 처분들의 처분가 합. 이 값이 크면 합계가 과소하므로 신고 전 확인이 필요하다.
+  unresolvedProceeds: string;
   computableEventCount: number;
   taxableEventCount: number;
+  // 미분류·시세 미확인·낮은 확신도에 더해, fold가 pnl_review를 남긴 이벤트도 포함한다.
   pendingReviewCount: number;
   spamEventCount: number;
   currency: string;
@@ -552,6 +570,59 @@ Content-Type: application/json
 - `isEstimate: true`, `disclaimer`
 
 모든 금액은 decimal 문자열입니다. `isEstimate`와 disclaimer는 UI에서 제거하거나 숨기지 마십시오.
+
+합계는 전체 이력을 이동평균법으로 fold한 뒤 각 처분의 실현손익을 해당 과세연도에 귀속해
+계산합니다. 연도 필터는 fold **이후**에 적용되므로 전년도 취득 원가가 올해 처분에 그대로
+반영됩니다. 취득은 합계에 0을 기여합니다.
+
+```ts
+type TotalsDTO = {
+  taxableGains: string; // Σ 처분 실현손익, 음수는 0으로 클램프
+  exemptGains: string;
+  incomeTotal: string;
+  taxableBase: string;
+  estimatedCharge: string;
+  effectiveRatePercent: string;
+  // 취득 원가를 확인할 수 없어(pnl_review = disposal_exceeds_holdings) 합계에서 제외한
+  // 처분들의 처분가 합. 원가가 "0"이 아니라 "모름"이므로 이익으로 더하지 않는다.
+  // 이 값이 크면 taxableGains는 과소이며 신고 전 확인이 필요하다.
+  unresolvedProceeds: string;
+};
+
+// 합계에서 빠진 이벤트를 이유별로 나눠 보고한다. 해당 이벤트가 하나도 없는 종류는
+// 배열에 등장하지 않는다. excludedEventIds는 세 종류의 합집합(하위 호환용 평면 목록).
+type LimitationDTO = {
+  kind: "excluded" | "review" | "non_taxable";
+  message: string;
+  eventIds: string[];
+};
+```
+
+| `kind` | 대상 | `message` |
+|---|---|---|
+| `excluded` | 시세 미확인으로 금액 자체를 모르는 이벤트 | 가격 미확인 이벤트는 계산에서 제외했습니다. |
+| `review` | 취득 원가 미확인 처분(`disposal_exceeds_holdings`) | 취득 원가를 확인할 수 없는 처분은 합계에서 제외하고 unresolvedProceeds로 보고했습니다. |
+| `non_taxable` | 스팸·미분류·내부 이체(브릿지 레그 포함) | 스팸·미분류·내부 이체 이벤트는 과세 대상이 아니므로 제외했습니다. |
+
+`judgments[]`에는 기존 필드(`eventId`, `at`, `asset`, `symbol`, `quantity`, `amount`,
+`amountKind`, `group`, `label`, `inPeriod`, `basis` 등)가 그대로 유지되고 다음이 추가됩니다.
+`amount`·`status`·`provenance`·`period`의 의미는 바뀌지 않았습니다.
+
+```ts
+type JudgmentExtraDTO = {
+  costBasis: string; // 이동평균 인식 원가. IN=취득 총원가, OUT=처분 수량의 원가
+  realizedPnl: string | null; // 실현손익. 취득(IN)은 null
+  // 검토 필요 사유. 없으면 null(이벤트 DTO의 pnl_review와 달리 항상 존재하는 키).
+  pnlReview: "disposal_exceeds_holdings" | "bridge_move_unmatched" | "gas_unpriced" | null;
+  // 처분(OUT) judgment에만 존재.
+  breakdown?: {
+    proceeds: string;
+    cost: string; // 이전에는 항상 "0"이었으나 이제 실제 인식 원가가 들어간다
+    fee: string; // gas_fee_native (코인 수량, 기존 필드)
+    feeFiat: string | null; // 가스비 원화 평가액. 평가 불가 시 null
+  };
+};
+```
 
 현재 제한: Backend v1 호환 계층에서는 `source: "scenario"`와 `source: "wallet"`이 모두 동기화된 지갑 이벤트를 사용합니다. `profile`과 `includeMarginal`도 요청 검증은 하지만 아직 계산에 반영하지 않습니다. FE 내부의 별도 국가 비교 scenario fixture 및 한계기여도와 완전히 같은 결과가 필요한 경우 후속 API 계약 확장이 필요합니다.
 
