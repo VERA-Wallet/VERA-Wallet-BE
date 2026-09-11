@@ -673,7 +673,7 @@ GET /api/portfolio/holdings
 
 상태 코드: `401` 세션 없음, `404` 바인딩된 지갑 없음, `503` 모든 체인 조회 실패(Real 모드에서 `ALCHEMY_API_KEY` 미설정 포함).
 
-프록시: **`/api/portfolio/*`를 FE 프록시의 backend-owned 경로에 추가해야 합니다.** 기존 `/api/events/*` 와일드카드에 포함되지 않습니다.
+프록시: 이 경로는 **프록시하지 않습니다.** FE Route Handler(`app/api/portfolio/holdings/route.ts`)가 ON 모드에서도 소유하며, 서버에서 BE를 호출한 뒤 `costBasis`(KRW)를 FE 환율 소스로 USD 환산해 클라이언트에는 원가까지 USD로 통일된 계약을 내려줍니다(`/api/tax/*`와 같은 배치). 기존 `/api/events/*` 와일드카드에 포함되지 않으므로 backend-owned 목록에 넣지 마십시오.
 
 Mock 모드는 데모 지갑(ETH 0.75 on Ethereum, USDC 500 on Base, USDT 850 on Polygon)과 그에 맞는 고정 시세를 돌려줍니다.
 
