@@ -88,6 +88,6 @@ const mock = process.env.MOCK_MODE !== "false";
     EventReclassificationService,
     AnchorProofService,
   ],
-  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY, COST_BASIS_SNAPSHOT],
+  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY, COST_BASIS_SNAPSHOT, PRICE_ORACLE],
 })
 export class IndexerModule {}

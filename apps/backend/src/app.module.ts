@@ -4,6 +4,7 @@ import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
 import { AuthModule } from "./auth/auth.module";
 import { IndexerModule } from "./indexer/indexer.module";
+import { PortfolioModule } from "./portfolio/portfolio.module";
 import { ReportModule } from "./report/report.module";
 import { TaxModule } from "./tax/tax.module";
 import { WalletModule } from "./wallet/wallet.module";
@@ -21,7 +22,7 @@ const queueImports = process.env.MOCK_MODE === "false"
   : [];
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, TaxModule, ReportModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, PortfolioModule, TaxModule, ReportModule],
   controllers: [AppController],
 })
 export class AppModule {}

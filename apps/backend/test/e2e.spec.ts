@@ -87,6 +87,19 @@ describe("VERA Wallet mock journey", () => {
     expect(estimate.body.data.disclaimer).toContain("추정치");
     const proof = await browser.get("/api/anchor-proof?eventId=event-01").expect(200);
     expect(proof.body.data.merkle_root).toMatch(/^0x[0-9a-f]{64}$/);
+    // Live balances (mock reader) joined with the mock ledger's cost fold: value in USD, cost in KRW.
+    const holdings = await browser.get("/api/portfolio/holdings").expect(200);
+    expect(holdings.body.meta.provenance).toBe("mock");
+    expect(holdings.body.data).toMatchObject({ walletAddresses: [account.address.toLowerCase()], skippedChainIds: [], truncatedChainIds: [], unpricedCount: 0 });
+    expect(holdings.body.data.holdings.map((h: { symbol: string; chainId: number; amount: string; valueUsd: string }) => [h.symbol, h.chainId, h.amount, h.valueUsd])).toEqual([
+      ["ETH", 1, "0.75", "2400"],
+      ["USDT", 137, "850", "850"],
+      ["USDC", 8453, "500", "500"],
+    ]);
+    expect(holdings.body.data.totalValueUsd).toBe("3750");
+    // The mock ledger holds native ETH on chain 1, so ETH carries a KRW cost cell; the stables were never indexed.
+    expect(holdings.body.data.holdings[0].costBasis).toMatchObject({ currency: "KRW" });
+    expect(holdings.body.data.holdings[1].costBasis).toBeNull();
   });
 
   it("binds a watch-only wallet: 401 unauth, 400 invalid, 201 + checksum, session marks watch_only", async () => {

@@ -1,6 +1,6 @@
 import Decimal from "decimal.js";
 import { describe, expect, it } from "vitest";
-import { computeCostBasis } from "./cost-basis";
+import { computeCostBasis, computeHoldingsCostBasis, holdingAssetKey } from "./cost-basis";
 import type { TaxableTransaction } from "./types";
 
 // Build an event with sane ERC20 defaults; override per case. raw_amount is in base
@@ -569,5 +569,46 @@ describe("computeCostBasis — gas", () => {
     expect(results.get("event-02")!.gasFiat).toBeUndefined();
     expect(results.get("event-03")!.gasFiat).toBeUndefined();
     expect(results.get("event-03")!.costBasis).toBe("3010000"); // exactly what the acquisition capitalized
+  });
+});
+
+describe("computeHoldingsCostBasis", () => {
+  it("returns the fold's terminal state: remaining quantity and moving-average cost per asset", () => {
+    // Buy 1 @ 1,000,000, buy 1 @ 2,000,000 (avg 1,500,000), sell 0.5 => 1.5 left @ 1,500,000.
+    const holdings = computeHoldingsCostBasis([
+      evt("01", "IN", "1", "1000000"),
+      evt("02", "IN", "1", "2000000"),
+      evt("03", "OUT", "0.5", "900000"),
+    ]);
+    const cell = holdings.get(holdingAssetKey(1, "ERC20", "0xAAA"))!;
+    expect(cell.qty).toBe("1.5");
+    expect(cell.avgCost).toBe("1500000");
+    expect(cell.totalCost).toBe("2250000");
+  });
+
+  it("omits cells that were fully disposed and keys native coins under `native`", () => {
+    const holdings = computeHoldingsCostBasis([
+      evt("01", "IN", "1", "1000000"),
+      evt("02", "OUT", "1", "1000000"),
+      evt("03", "IN", "2", "5000000", { asset_type: "NATIVE", asset_contract: null }),
+    ]);
+    expect(holdings.has(holdingAssetKey(1, "ERC20", "0xAAA"))).toBe(false);
+    const native = holdings.get(holdingAssetKey(1, "NATIVE", null))!;
+    expect(native.qty).toBe("2");
+    expect(native.avgCost).toBe("2500000");
+  });
+
+  it("lowercases the contract in the key so a checksummed balance row joins its ledger cell", () => {
+    const holdings = computeHoldingsCostBasis([evt("01", "IN", "1", "1000000")]);
+    expect(holdings.get(holdingAssetKey(1, "ERC20", "0xaaa"))).toBeDefined();
+    expect(holdingAssetKey(1, "ERC20", "0xAAA")).toBe("1:ERC20:0xaaa:");
+  });
+
+  it("agrees with computeCostBasis on the same ledger (one fold, two views)", () => {
+    const ledger = [evt("01", "IN", "3", "3000000"), evt("02", "OUT", "1", "2000000")];
+    const events = computeCostBasis(ledger);
+    const holdings = computeHoldingsCostBasis(ledger);
+    expect(events.get("event-02")!.costBasis).toBe("1000000");
+    expect(holdings.get(holdingAssetKey(1, "ERC20", "0xAAA"))!.totalCost).toBe("2000000");
   });
 });

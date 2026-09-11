@@ -30,6 +30,12 @@ export interface ChainRegistryEntry {
    * a source that answers is authoritative even when it recovers nothing.
    */
   nativeSources: readonly NativeValueSource[];
+  /**
+   * Canonical wrapped-native ERC20 (WETH / WPOL) on this chain. The native coin has no contract
+   * address, so its USD market is read through the wrapped token, which trades 1:1 and is the
+   * deepest pool on every chain. Lowercased; `null` would mean "no wrapped market known".
+   */
+  wrappedNativeContract: string | null;
 }
 
 // Alchemy `internal` (trace) transfers are supported only on Ethereum, Polygon, and Base
@@ -51,11 +57,11 @@ const TRACE_THEN_BALANCE: readonly NativeValueSource[] = ["alchemy-debug", "bala
 // does NOT itself provide dynamic discovery. Order is load-bearing: the mock
 // adapter maps fixtures by `index % length`, so it must stay [1,8453,42161,10,137].
 export const CHAIN_REGISTRY: readonly ChainRegistryEntry[] = [
-  { chainId: 1, network: "eth-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY },
-  { chainId: 8453, network: "base-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY },
-  { chainId: 42161, network: "arb-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: NO_INTERNAL, nativeSources: TRACE_THEN_BALANCE },
-  { chainId: 10, network: "opt-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: NO_INTERNAL, nativeSources: TRACE_THEN_BALANCE },
-  { chainId: 137, network: "polygon-mainnet", nativeSymbol: "POL", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY },
+  { chainId: 1, network: "eth-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY, wrappedNativeContract: "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2" },
+  { chainId: 8453, network: "base-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY, wrappedNativeContract: "0x4200000000000000000000000000000000000006" },
+  { chainId: 42161, network: "arb-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: NO_INTERNAL, nativeSources: TRACE_THEN_BALANCE, wrappedNativeContract: "0x82af49447d8a07e3bd95bd0d56f35241523fbab1" },
+  { chainId: 10, network: "opt-mainnet", nativeSymbol: "ETH", nativeDecimals: 18, supportedCategories: NO_INTERNAL, nativeSources: TRACE_THEN_BALANCE, wrappedNativeContract: "0x4200000000000000000000000000000000000006" },
+  { chainId: 137, network: "polygon-mainnet", nativeSymbol: "POL", nativeDecimals: 18, supportedCategories: FULL, nativeSources: NO_RECOVERY, wrappedNativeContract: "0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270" },
 ];
 
 export const SUPPORTED_CHAIN_IDS: readonly number[] = CHAIN_REGISTRY.map((entry) => entry.chainId);

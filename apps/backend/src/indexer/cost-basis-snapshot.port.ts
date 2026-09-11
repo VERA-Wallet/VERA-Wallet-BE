@@ -1,4 +1,4 @@
-import type { CostBasisResult } from "@vera/tax-engine";
+import type { CostBasisResult, HoldingCostBasis } from "@vera/tax-engine";
 import type { TransactionRecord } from "../shared/repository.types";
 
 // Framework-free port over the shared cost-basis fold. Another feature module (tax) reads
@@ -9,4 +9,7 @@ export interface CostBasisSnapshotPort {
   // pass the whole ledger: a period filter applied first drops the prior-year
   // acquisitions that carry cost into this year's disposals.
   snapshotFor(userId: string, rows: TransactionRecord[], opts?: { gas?: boolean }): Promise<Map<string, CostBasisResult>>;
+  // Terminal state of the same fold: remaining quantity + average cost per asset cell, keyed
+  // by `holdingAssetKey`. Same full-ledger requirement; the portfolio read joins live balances on it.
+  holdingsFor(userId: string, rows: TransactionRecord[], opts?: { gas?: boolean }): Promise<Map<string, HoldingCostBasis>>;
 }
