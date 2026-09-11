@@ -12,6 +12,7 @@ import type { TransactionRecord } from "../shared/repository.types";
 import type { WalletRepository } from "../wallet/wallet.repository";
 import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import type { BalanceReader, BalanceSnapshot, TokenMetadata } from "./balance-reader";
+import { canonicalAssetIdOf } from "./canonical-asset";
 import { BALANCE_READER } from "./portfolio.tokens";
 
 // The ledger's fiat unit. Every event carries `fiat_currency: "KRW"` (indexer.adapters.ts), so the
@@ -59,6 +60,11 @@ export interface HoldingDto {
   /** `priced` / `illiquid` / `no_market` are confirmed market states; `unknown` means the lookup failed. */
   priceStatus: HoldingPriceStatus;
   costBasis: HoldingCostDto | null;
+  /**
+   * 표시용 정식 자산 키(`eth`, `usdc`…). 다른 체인의 같은 발행처 토큰이 같은 키를 갖는다 — 화면이 행을 합칠 때 쓴다.
+   * 표에 없는 토큰은 null이라 합쳐지지 않는다. 심볼로 정하지 않는다(canonical-asset.ts).
+   */
+  canonicalAssetId: string | null;
 }
 
 /** 지갑 하나의 요약. 목록 화면이 행마다 "이 지갑에 얼마가, 어느 체인에" 있는지를 이걸로 말한다. */
@@ -432,6 +438,7 @@ function toHoldingDto(asset: PricedAsset, cost: HoldingCostBasis | undefined): H
     valueUsd,
     priceStatus,
     costBasis: cost ? { currency: COST_CURRENCY, totalCost: cost.totalCost, avgCost: cost.avgCost, trackedAmount: cost.qty } : null,
+    canonicalAssetId: canonicalAssetIdOf(asset.chainId, asset.assetType, asset.contract),
   };
 }
 

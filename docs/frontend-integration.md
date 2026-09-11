@@ -670,6 +670,7 @@ GET /api/auth/wallets                    # 등록한 지갑 목록 { wallets: [{
 - `amount`는 `rawAmount / 10^decimals`를 정확히 십진 문자열로 편 값입니다(반올림 없음). 표시 반올림은 FE 몫입니다.
 - **통화가 둘입니다.** 시세·평가액은 USD(`priceUsd`, `valueUsd`, `totalValueUsd`), 취득원가는 원장 통화인 KRW(`costBasis.currency`)입니다. BE는 환율을 갖지 않으므로 평가손익을 한 통화로 보여주려면 FE의 환율 소스(`VERAWALLET_FX_SOURCE`)로 한쪽을 환산해야 합니다.
 - `priceStatus`: `priced`(시세 있음) / `illiquid`(DEX 페어는 있으나 가격 없음) / `no_market`(페어 없음, 스테이블·네이티브·허용목록 외에는 더스트로 숨김) / `unknown`(조회 실패 — 값이 없을 뿐 0이 아님). `priceUsd`가 `null`이면 `valueUsd`도 `null`이고 `unpricedCount`에 셉니다.
+- `canonicalAssetId`: 표시용 정식 자산 키(`eth`·`usdc`·`usdt`·`dai`·`pol`·`ath`·`carv`…). 다른 체인의 같은 발행처 토큰이 같은 키를 가지므로 화면이 행을 합칠 수 있습니다. 표에 없는 토큰은 `null`이라 합치지 마십시오. 심볼로 묶지 않습니다(사칭·브릿지 변종 방지). 원장·세금 계산은 체인별 그대로입니다.
 - `costBasis`가 `null`이면 원장이 그 자산을 모릅니다(불러오기 진행 중이거나 이벤트가 없음). `trackedAmount`와 `amount`가 다르면 원장이 잔액을 다 설명하지 못하는 것이니 "원가 계산 중/불완전" 상태로 다루십시오.
 - `skippedChainIds`: 이번 호출에서 읽지 못한 체인. 그 체인 자산은 **없는 게 아니라 모르는 것**입니다. `truncatedChainIds`: 토큰 목록이 페이지 상한(2,000개)을 넘었거나 원장에 없는 미확인 토큰이 체인당 40개를 넘어 나머지를 생략한 체인. `unresolvedCount`: 공급자 메타데이터 조회가 **실패**해서 빠진 ERC20 수(0보다 크면 목록이 불완전하니 "일부 자산 조회 실패"로 표시).
 - `symbol`·`decimals`는 공급자 메타데이터(`alchemy_getTokenMetadata`)가 우선이고 원장은 조회 실패 시 대체입니다. 원장의 decimals는 인덱서가 18로 추측했을 수 있기 때문입니다.

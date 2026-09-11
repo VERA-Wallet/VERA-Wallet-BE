@@ -126,6 +126,9 @@ describe("PortfolioHoldingsService.holdings", () => {
     expect(eth.costBasis).toEqual({ currency: "KRW", totalCost: "3000000", avgCost: "4000000", trackedAmount: "0.75" });
     expect(usdc).toMatchObject({ assetType: "ERC20", contract: USDC, name: "USD Coin", decimals: 6, amount: "500", valueUsd: "500", priceStatus: "priced" });
     expect(usdc.costBasis).toEqual({ currency: "KRW", totalCost: "700000", avgCost: "1400", trackedAmount: "500" });
+    // 정식 자산 키: 네이티브 ETH는 eth, 표에 없는 컨트랙트(USDC 픽스처 주소는 실제 USDC가 아니다)는 null.
+    expect(eth.canonicalAssetId).toBe("eth");
+    expect(usdc.canonicalAssetId).toBeNull();
     expect(result.totalValueUsd).toBe("2900");
     expect(result.unpricedCount).toBe(0);
     expect(result.byWallet).toEqual([{ address: WALLET_A, verificationMethod: "siwe", totalValueUsd: "2900", chainIds: [1], holdingsCount: 2, unpricedCount: 0 }]);
