@@ -1,8 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { ServiceUnavailableException } from "@nestjs/common";
+import { Logger, ServiceUnavailableException } from "@nestjs/common";
 import type { ConfigService } from "@nestjs/config";
 import { AlchemyAdapter, MockAlchemyAdapter } from "./indexer.adapters";
-import { SUPPORTED_CHAIN_IDS } from "./chain-registry";
+import { CHAIN_REGISTRY, SUPPORTED_CHAIN_IDS } from "./chain-registry";
 import { MockTransactionRepository } from "./transaction.repository.adapters";
 
 const makeConfig = (values: Record<string, string | undefined>) =>
@@ -23,17 +23,123 @@ type Spec =
 
 interface CallRecord {
   network: string;
-  direction: "in" | "out";
+  direction: "in" | "out" | "trace" | "receipt" | "tx" | "balance";
   method: string;
   params: Record<string, any>;
 }
 
-function makeFetch(map: Record<string, Spec[]>, calls: CallRecord[]) {
+// One stubbed JSON-RPC failure: an HTTP status carrying the error, or a 200 carrying it in the body.
+interface RpcFailure {
+  httpStatus?: number;
+  code?: number;
+  message: string;
+}
+
+// Stubbed `eth_*` chain state for the balance-diff native source, keyed by transaction hash.
+// Everything defaults to "the wallet is not involved and nothing moved", so a test that only cares
+// about tracing sees no recovered leg instead of a crash when balance-diff runs behind it.
+interface ChainState {
+  block?: number;
+  status?: string;
+  gasUsed?: string;
+  /** null omits the field from the receipt, as a node that reports no effective gas price would. */
+  effectiveGasPrice?: string | null;
+  l1Fee?: string;
+  from?: string;
+  to?: string | null;
+  value?: string;
+  gasPrice?: string;
+  /** Wallet native balance at `block - 1` and at `block`. */
+  before?: string;
+  after?: string;
+  missingReceipt?: true;
+  receiptFailure?: RpcFailure;
+  txFailure?: RpcFailure;
+  balanceFailure?: RpcFailure;
+}
+
+// One stubbed `debug_traceTransaction` response, keyed by transaction hash.
+type TraceSpec =
+  | { root: unknown }
+  | { httpStatus: number; error?: { code?: number; message: string } }
+  | { rpcError: string; code?: number };
+
+// A trace with no sub-frames: the default for any hash the test did not stub, so an unexpected
+// trace call is visible as "no recovered legs" rather than as a crash.
+const emptyTrace = () => ({ type: "CALL", from: WALLET, to: CP, value: "0x0", gas: "0x1", gasUsed: "0x1", input: "0x" });
+
+function makeFetch(
+  map: Record<string, Spec[]>,
+  calls: CallRecord[],
+  traces: Record<string, TraceSpec> = {},
+  states: Record<string, ChainState> = {},
+) {
   const counters: Record<string, number> = {};
+  const DEFAULTS = { status: "0x1", gasUsed: "0x0", effectiveGasPrice: "0x0" as string | null, from: CP, to: CP as string | null, value: "0x0", before: "0x0", after: "0x0" };
+  // Distinct per hash so two unrelated candidates never land in one block and trip the ambiguity guard.
+  const blockOf = (hash: string) => states[hash]?.block ?? 1_000_000 + Number.parseInt(hash.slice(2, 6), 16);
+  const stateOf = (hash: string) => ({ ...DEFAULTS, ...states[hash], block: states[hash]?.block ?? blockOf(hash) });
+  const hexOf = (block: number) => `0x${block.toString(16)}`;
+  const balanceAt = (tag: string) => {
+    for (const hash of Object.keys(states)) {
+      const state = stateOf(hash);
+      if (tag === hexOf(state.block)) return state.after;
+      if (tag === hexOf(state.block - 1)) return state.before;
+    }
+    return "0x0";
+  };
+  const failed = (failure: RpcFailure) =>
+    failure.httpStatus === undefined
+      ? { ok: true, status: 200, json: async () => ({ error: { code: failure.code, message: failure.message } }) }
+      : { ok: false, status: failure.httpStatus, headers: { get: () => null }, json: async () => ({ error: { code: failure.code, message: failure.message } }) };
+  const balanceFailure = Object.values(states).find((state) => state.balanceFailure)?.balanceFailure;
+
   return vi.fn(async (url: string, init: any) => {
     const network = /https:\/\/([^.]+)\.g\.alchemy\.com/.exec(url)?.[1] ?? "";
     const body = JSON.parse(init.body);
     if (body.method === "eth_blockNumber") return { ok: true, status: 200, json: async () => ({ result: "0xf4240" }) };
+    if (body.method === "eth_getTransactionReceipt") {
+      const hash = body.params[0];
+      calls.push({ network, direction: "receipt", method: body.method, params: { hash } });
+      const state = stateOf(hash);
+      if (state.receiptFailure) return failed(state.receiptFailure);
+      const receipt = state.missingReceipt
+        ? null
+        : {
+            blockNumber: hexOf(state.block),
+            status: state.status,
+            gasUsed: state.gasUsed,
+            ...(state.effectiveGasPrice === null ? {} : { effectiveGasPrice: state.effectiveGasPrice }),
+            ...(state.l1Fee === undefined ? {} : { l1Fee: state.l1Fee }),
+          };
+      return { ok: true, status: 200, json: async () => ({ result: receipt }) };
+    }
+    if (body.method === "eth_getTransactionByHash") {
+      const hash = body.params[0];
+      calls.push({ network, direction: "tx", method: body.method, params: { hash } });
+      const state = stateOf(hash);
+      if (state.txFailure) return failed(state.txFailure);
+      const transaction = { from: state.from, to: state.to, value: state.value, ...(state.gasPrice === undefined ? {} : { gasPrice: state.gasPrice }) };
+      return { ok: true, status: 200, json: async () => ({ result: transaction }) };
+    }
+    if (body.method === "eth_getBalance") {
+      const [account, tag] = body.params;
+      calls.push({ network, direction: "balance", method: body.method, params: { account, tag } });
+      if (balanceFailure) return failed(balanceFailure);
+      return { ok: true, status: 200, json: async () => ({ result: balanceAt(tag) }) };
+    }
+    if (body.method === "debug_traceTransaction") {
+      const hash = body.params[0];
+      calls.push({ network, direction: "trace", method: body.method, params: { hash, options: body.params[1] } });
+      const spec = traces[hash];
+      if (spec && "httpStatus" in spec) {
+        return { ok: false, status: spec.httpStatus, headers: { get: () => null }, json: async () => (spec.error ? { error: spec.error } : {}) };
+      }
+      if (spec && "rpcError" in spec) {
+        return { ok: true, status: 200, json: async () => ({ error: { message: spec.rpcError, ...(spec.code === undefined ? {} : { code: spec.code }) } }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ result: spec ? spec.root : emptyTrace() }) };
+    }
     const params = body.params[0];
     const direction: "in" | "out" = params.toAddress ? "in" : "out";
     const key = `${network}:${direction}`;
@@ -81,6 +187,17 @@ const run = async (map: Record<string, Spec[]>, calls: CallRecord[] = [], apiKey
   // 429 retry backoff is real time; keep it negligible so rate-limit tests stay fast.
   const adapter = new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: apiKey, ALCHEMY_RETRY_BASE_MS: "1" }));
   return (await adapter.fetchTransactions(WALLET)).transactions;
+};
+
+// Full ChainScanResult with stubbed callTracer traces (native-value recovery on NO_INTERNAL chains).
+const runTraced = async (
+  map: Record<string, Spec[]>,
+  traces: Record<string, TraceSpec>,
+  calls: CallRecord[] = [],
+  states: Record<string, ChainState> = {},
+) => {
+  vi.stubGlobal("fetch", makeFetch(map, calls, traces, states));
+  return new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: "key", ALCHEMY_RETRY_BASE_MS: "1" })).fetchTransactions(WALLET, undefined);
 };
 
 // Full ChainScanResult (for chainHeads / partial-outage assertions).
@@ -858,6 +975,22 @@ describe("AlchemyAdapter bridge suspicion (conservative flag-only)", () => {
       expect(event.payload.confidence as number).toBeLessThan(0.5);
     }
   });
+
+  it("labels a leg routed through the Across SpokePool on Arbitrum with the curated display name", async () => {
+    const ACROSS_ARB = "0xe35e9842fceaca96570b734083f4a58e8f7c5f2a"; // Across: SpokePool, chain 42161
+    const hash = "0x" + "79".repeat(32);
+    const out = await run({ "arb-mainnet:out": [{ transfers: [{ ...nativeIn(hash), from: WALLET, to: ACROSS_ARB }] }] });
+    const event = find(out, hash);
+    expect(event.payload.bridge_suspected).toBe(true);
+    expect(event.payload.counterparty_label).toBe("Across: SpokePool");
+  });
+
+  it("omits counterparty_label entirely (never writes null) for a leg with an unknown counterparty", async () => {
+    const hash = "0x" + "7a".repeat(32);
+    const out = await run({ "eth-mainnet:out": [{ transfers: [{ ...nativeIn(hash), from: WALLET, to: CP }] }] });
+    const event = find(out, hash);
+    expect(event.payload).not.toHaveProperty("counterparty_label");
+  });
 });
 
 describe("AlchemyAdapter bounded parallel fan-out", () => {
@@ -911,5 +1044,903 @@ describe("AlchemyAdapter bounded parallel fan-out", () => {
     expect(attempts["eth-mainnet:in"]).toBe(2);
     expect(out.transactions.some((t) => t.payload.chain_id === 1)).toBe(true);
     expect(out.chainHeads[1]).toBe(0xf4240);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Native-value recovery on chains where Alchemy has no `internal` category.
+//
+// Arbitrum (42161) and Optimism (10) do not return trace transfers from
+// alchemy_getAssetTransfers, so a router paying the wallet in NATIVE ETH was
+// invisible: only the token disposal landed, and a later ETH send computed a
+// cost basis of 0. These cover the debug_traceTransaction recovery path.
+// ---------------------------------------------------------------------------
+describe("AlchemyAdapter native-value recovery (Arbitrum / Optimism)", () => {
+  const ROUTER = "0x3333333333333333333333333333333333333333";
+  const WETH_ARB = "0x82af49447d8a07e3bd95bd0d56f35241523fbab1";
+  const ACROSS_ARB = "0xe35e9842fceaca96570b734083f4a58e8f7c5f2a"; // Across SpokePool, chain 42161
+
+  const frame = (fields: Record<string, unknown>, ...calls: unknown[]) => ({
+    type: "CALL",
+    from: ROUTER,
+    to: CP,
+    value: "0x0",
+    gas: "0x1",
+    gasUsed: "0x1",
+    input: "0x",
+    ...fields,
+    ...(calls.length > 0 ? { calls } : {}),
+  });
+
+  // The reported shape: wallet sends USDC to a router, the router unwraps WETH and pays ETH back.
+  const swapTrace = (payout: string) =>
+    frame({ from: WALLET, to: ROUTER }, frame({ from: ROUTER, to: WETH_ARB }, frame({ from: WETH_ARB, to: WALLET, value: payout })));
+
+  it("gives only the chains that need it a native-recovery source list, trace before balance diff", () => {
+    const byId = new Map(CHAIN_REGISTRY.map((entry) => [entry.chainId, entry]));
+    // Order is the fallback order: the trace is an exact list of movements, the diff only their net.
+    expect(byId.get(42161)?.nativeSources).toEqual(["alchemy-debug", "balance-diff"]);
+    expect(byId.get(10)?.nativeSources).toEqual(["alchemy-debug", "balance-diff"]);
+    for (const chainId of [1, 8453, 137]) expect(byId.get(chainId)?.nativeSources).toEqual([]);
+    expect(byId.get(42161)?.supportedCategories).toEqual(["external", "erc20", "erc721", "erc1155"]);
+    // getAssetTransfers categories stay independent of how native value is recovered.
+    for (const chainId of [1, 8453, 137]) expect(byId.get(chainId)?.supportedCategories).toContain("internal");
+  });
+
+  it("turns a USDC -> ETH swap on Arbitrum into one EXCHANGE/RECEIVE pair with a shared group_id", async () => {
+    const hash = "0x" + "c8".repeat(32);
+    const { transactions } = await runTraced(
+      { "arb-mainnet:out": [{ transfers: [erc20(hash, 4, WALLET, ROUTER, TOKEN_A, "USDC", "0x1312d00")] }] },
+      { [hash]: { root: swapTrace("0x1683b9ce8000") } },
+    );
+
+    const arb = transactions.filter((t) => t.payload.chain_id === 42161);
+    expect(arb).toHaveLength(2);
+    const disposal = arb.find((t) => t.payload.classification === "EXCHANGE")!;
+    const acquisition = arb.find((t) => t.payload.classification === "RECEIVE")!;
+
+    expect(disposal.eventType).toBe("swap");
+    expect(disposal.payload.asset_type).toBe("ERC20");
+    expect(disposal.payload.raw_amount).toBe(String(BigInt("0x1312d00")));
+
+    // The leg that used to go missing entirely: the ETH acquisition that anchors cost basis.
+    expect(acquisition.eventType).toBe("transfer_in");
+    expect(acquisition.payload.asset_type).toBe("NATIVE");
+    expect(acquisition.payload.asset_contract).toBeNull();
+    expect(acquisition.payload.symbol).toBe("ETH");
+    expect(acquisition.payload.decimals).toBe(18);
+    expect(acquisition.payload.raw_amount).toBe(String(BigInt("0x1683b9ce8000")));
+    expect(acquisition.payload.counterparty).toBe(WETH_ARB);
+    expect(acquisition.payload.income_kind).toBeNull();
+
+    expect(disposal.payload.group_id).toBe(`42161:${hash}`);
+    expect(acquisition.payload.group_id).toBe(disposal.payload.group_id);
+    // Deterministic storage id: chain, tx, "internal", frame path.
+    expect(acquisition.txHash).toBe(`42161:${hash}:internal:0_0`);
+    expect(acquisition.payload.id).toBe(`42161:${hash}:internal:0_0`);
+    expect(acquisition.payload.tx_hash).toBe(hash);
+  });
+
+  it("requests callTracer exactly once per candidate transaction, on that chain's host only", async () => {
+    const hash = "0x" + "c9".repeat(32);
+    const calls: CallRecord[] = [];
+    await runTraced(
+      { "arb-mainnet:out": [{ transfers: [erc20(hash, 1, WALLET, ROUTER, TOKEN_A, "USDC")] }] },
+      { [hash]: { root: swapTrace("0x2386f26fc10000") } },
+      calls,
+    );
+    const traceCalls = calls.filter((c) => c.direction === "trace");
+    expect(traceCalls).toHaveLength(1);
+    expect(traceCalls[0].network).toBe("arb-mainnet");
+    expect(traceCalls[0].params.hash).toBe(hash);
+    expect(traceCalls[0].params.options).toEqual({ tracer: "callTracer", tracerConfig: { onlyTopCall: false } });
+  });
+
+  it("never traces a chain that already returns the `internal` category", async () => {
+    const hash = "0x" + "ca".repeat(32);
+    const calls: CallRecord[] = [];
+    await runTraced({ "eth-mainnet:out": [{ transfers: [erc20(hash, 1, WALLET, ROUTER, TOKEN_A, "USDC")] }] }, {}, calls);
+    expect(calls.filter((c) => c.direction === "trace")).toHaveLength(0);
+  });
+
+  it("never traces a plain inbound native transfer (its only frame is already collected)", async () => {
+    const calls: CallRecord[] = [];
+    await runTraced({ "arb-mainnet:in": [{ transfers: [nativeIn("0x" + "cb".repeat(32))] }] }, {}, calls);
+    expect(calls.filter((c) => c.direction === "trace")).toHaveLength(0);
+  });
+
+  it("traces a wallet-initiated native transaction, recovering an ETH refund", async () => {
+    // ETH -> token swap that partially refunds: the external OUT is the disposal, the refund is a
+    // second native leg that would otherwise be lost.
+    const hash = "0x" + "cc".repeat(32);
+    const outbound = { ...nativeIn(hash), from: WALLET, to: ROUTER };
+    const { transactions } = await runTraced(
+      { "arb-mainnet:out": [{ transfers: [outbound] }] },
+      { [hash]: { root: frame({ from: WALLET, to: ROUTER }, frame({ from: ROUTER, to: WALLET, value: "0x5af3107a4000" })) } },
+    );
+    const refund = transactions.find((t) => t.txHash === `42161:${hash}:internal:0`);
+    expect(refund?.payload.direction).toBe("IN");
+    expect(refund?.payload.raw_amount).toBe(String(BigInt("0x5af3107a4000")));
+  });
+
+  it("flags a trace-recovered bridge payout as a review-gated IN leg", async () => {
+    // A bridge fill that delivers native ETH alongside a token, discoverable through the token leg.
+    const hash = "0x" + "cd".repeat(32);
+    const { transactions } = await runTraced(
+      { "arb-mainnet:in": [{ transfers: [erc20(hash, 7, ACROSS_ARB, WALLET, TOKEN_B, "BBB")] }] },
+      { [hash]: { root: frame({ from: CP, to: ACROSS_ARB }, frame({ from: ACROSS_ARB, to: WALLET, value: "0x3856a5bd2800" })) } },
+    );
+    const native = transactions.find((t) => t.txHash === `42161:${hash}:internal:0`)!;
+    expect(native.payload.classification).toBe("RECEIVE");
+    expect(native.payload.counterparty).toBe(ACROSS_ARB);
+    expect(native.payload.bridge_suspected).toBe(true);
+    expect(native.payload.confidence as number).toBeLessThan(0.5);
+  });
+
+  it("keeps several native legs of one transaction distinct under the (txHash, eventType) key", async () => {
+    const hash = "0x" + "ce".repeat(32);
+    const { transactions } = await runTraced(
+      { "arb-mainnet:in": [{ transfers: [erc20(hash, 2, CP, WALLET, TOKEN_B, "BBB")] }] },
+      {
+        [hash]: {
+          root: frame(
+            { from: CP, to: ROUTER },
+            frame({ from: ROUTER, to: WALLET, value: "0x64" }),
+            frame({ from: ROUTER, to: WALLET, value: "0xc8" }),
+          ),
+        },
+      },
+    );
+    const arb = transactions.filter((t) => t.payload.chain_id === 42161);
+    const natives = arb.filter((t) => t.payload.asset_type === "NATIVE");
+    expect(natives.map((t) => t.txHash)).toEqual([`42161:${hash}:internal:0`, `42161:${hash}:internal:1`]);
+    expect(natives.map((t) => t.payload.raw_amount)).toEqual(["100", "200"]);
+    // The frozen upsert key is (bindingId, txHash, eventType): no two rows of this tx may collide.
+    expect(new Set(arb.map((t) => `${t.txHash}|${t.eventType}`)).size).toBe(arb.length);
+  });
+
+  it("reproduces identical ids on a re-sync, so recovery is idempotent", async () => {
+    const hash = "0x" + "cf".repeat(32);
+    const map = { "arb-mainnet:out": [{ transfers: [erc20(hash, 4, WALLET, ROUTER, TOKEN_A, "USDC", "0x1312d00")] }] };
+    const traces = { [hash]: { root: swapTrace("0x1683b9ce8000") } };
+    const first = await runTraced(map, traces);
+    const second = await runTraced(map, traces);
+    const key = (r: Awaited<ReturnType<typeof runTraced>>) =>
+      r.transactions.map((t) => `${t.txHash}|${t.eventType}|${t.payload.raw_amount}|${t.payload.group_id}`);
+    expect(key(second)).toEqual(key(first));
+  });
+
+  it("withholds the WHOLE chain when a trace fails, keeping other chains complete", async () => {
+    for (const failure of [{ rpcError: "trace unavailable" }, { httpStatus: 500 }] as const) {
+      const hash = "0x" + "d0".repeat(32);
+      const result = await runTraced(
+        {
+          "arb-mainnet:out": [{ transfers: [erc20(hash, 4, WALLET, ROUTER, TOKEN_A, "USDC")] }],
+          "base-mainnet:in": [{ transfers: [nativeIn("0x" + "d2".repeat(32))] }],
+        },
+        { [hash]: failure },
+      );
+      // Cursor held: a half-observed chain must never persist the USDC leg as a bare SEND.
+      expect(result.chainHeads[42161]).toBeUndefined();
+      expect(result.transactions.some((t) => t.payload.chain_id === 42161)).toBe(false);
+      expect(result.chainHeads[8453]).toBeDefined();
+      expect(result.transactions.some((t) => t.payload.chain_id === 8453)).toBe(true);
+    }
+  });
+
+  it("recovers native legs on Optimism through the same path", async () => {
+    const hash = "0x" + "d3".repeat(32);
+    const { transactions } = await runTraced(
+      { "opt-mainnet:out": [{ transfers: [erc20(hash, 4, WALLET, ROUTER, TOKEN_A, "USDC", "0x1312d00")] }] },
+      { [hash]: { root: swapTrace("0x1683b9ce8000") } },
+    );
+    const opt = transactions.filter((t) => t.payload.chain_id === 10);
+    expect(opt).toHaveLength(2);
+    expect(opt.find((t) => t.payload.asset_type === "NATIVE")?.txHash).toBe(`10:${hash}:internal:0_0`);
+  });
+});
+
+describe("AlchemyAdapter same-asset residual netting (AC9)", () => {
+  // The reported Aave withdraw (Ethereum, 2025-12-03, 0xbde5610f…): the wallet burns aEthWETH at the
+  // WrappedTokenGateway and gets ETH back, and the pool mints the interest accrued in that same block
+  // — a third leg in the SAME asset it just sent. Koinly reads the transaction as one trade.
+  const GATEWAY = "0xd01607c3c5ecaba394d8be377a08590149325722";
+  const MINT = "0x0000000000000000000000000000000000000000";
+  const A_WETH = "0x4d5f47fa6a74757f35c14fd3a6ef8e3c9bc514e8";
+  const BURNED = "0xb5e6219339ec"; // 200000010402284 aEthWETH base units
+  const ACCRUED = "0x6de32f"; // 7201583 base units of interest minted in the same block
+
+  const aaveWithdraw = (hash: string) =>
+    ({
+      "eth-mainnet:out": [{ transfers: [erc20(hash, 0, WALLET, GATEWAY, A_WETH, "aEthWETH", BURNED)] }],
+      "eth-mainnet:in": [
+        {
+          transfers: [
+            { ...nativeIn(hash, 1, BURNED), from: GATEWAY, category: "internal" },
+            erc20(hash, 2, MINT, WALLET, A_WETH, "aEthWETH", ACCRUED),
+          ],
+        },
+      ],
+    }) as Record<string, Spec[]>;
+
+  it("nets an Aave-style interest residual into the disposal and pairs the rest as one swap", async () => {
+    const hash = "0x" + "a1".repeat(32);
+    const out = await run(aaveWithdraw(hash));
+
+    expect(out).toHaveLength(2);
+    expect(out.some((t) => t.payload.classification === "UNKNOWN")).toBe(false);
+
+    const disposal = out.find((t) => t.payload.direction === "OUT")!;
+    const acquisition = out.find((t) => t.payload.direction === "IN")!;
+
+    expect(disposal.eventType).toBe("swap");
+    expect(disposal.payload.classification).toBe("EXCHANGE");
+    expect(disposal.payload.symbol).toBe("aEthWETH");
+    // 200000010402284 sent - 7201583 minted back = the amount actually disposed of. Exact base units.
+    expect(disposal.payload.raw_amount).toBe("200000003200701");
+    // The absorbed leg is named, not silently lost: provenance still points at the row it folded into.
+    expect(disposal.payload.netted_leg_ids).toEqual([`1:${hash}:log:2`]);
+
+    expect(acquisition.eventType).toBe("transfer_in");
+    expect(acquisition.payload.classification).toBe("RECEIVE");
+    expect(acquisition.payload.asset_type).toBe("NATIVE");
+    expect(acquisition.payload.raw_amount).toBe("200000010402284");
+    expect(acquisition.payload.income_kind).toBeNull();
+    // The acquisition side absorbed nothing, so it carries no netting annotation.
+    expect(acquisition.payload).not.toHaveProperty("netted_leg_ids");
+
+    // Same pairing contract as any other swap: ONE shared opaque group_id, both sides above the floor.
+    expect(disposal.payload.group_id).toBe(`1:${hash}`);
+    expect(acquisition.payload.group_id).toBe(disposal.payload.group_id);
+    expect(out.every((t) => t.payload.confidence === 0.6)).toBe(true);
+  });
+
+  it("nets the mirror shape: a fee taken back in the asset the wallet just received", async () => {
+    // One asset in (TOKEN_B), two out: the real disposal (TOKEN_A) plus a fee charged in TOKEN_B.
+    const hash = "0x" + "a2".repeat(32);
+    const out = await run({
+      "eth-mainnet:in": [{ transfers: [erc20(hash, 0, CP, WALLET, TOKEN_B, "BBB", "0xde0b6b3a7640000")] }],
+      "eth-mainnet:out": [
+        {
+          transfers: [
+            erc20(hash, 1, WALLET, CP, TOKEN_A, "AAA", "0x2faf080"),
+            erc20(hash, 2, WALLET, CP, TOKEN_B, "BBB", "0xaa87bee538000"),
+          ],
+        },
+      ],
+    });
+
+    expect(out).toHaveLength(2);
+    const disposal = out.find((t) => t.payload.direction === "OUT")!;
+    const acquisition = out.find((t) => t.payload.direction === "IN")!;
+
+    expect(disposal.payload.classification).toBe("EXCHANGE");
+    expect(disposal.payload.asset_contract).toBe(TOKEN_A);
+    expect(disposal.payload.raw_amount).toBe("50000000");
+    expect(disposal.payload).not.toHaveProperty("netted_leg_ids");
+
+    expect(acquisition.payload.classification).toBe("RECEIVE");
+    // 1e18 received - 3e15 fee = what the wallet kept.
+    expect(acquisition.payload.raw_amount).toBe("997000000000000000");
+    expect(acquisition.payload.netted_leg_ids).toEqual([`1:${hash}:log:2`]);
+    expect(acquisition.payload.group_id).toBe(`1:${hash}`);
+    expect(disposal.payload.group_id).toBe(acquisition.payload.group_id);
+  });
+
+  it("leaves a 2-IN / 1-OUT mix ambiguous when neither inbound asset is the one that left", async () => {
+    const hash = "0x" + "a3".repeat(32);
+    const nativeLeg = { ...nativeIn(hash, 2), category: "internal" };
+    const out = await run({
+      "eth-mainnet:out": [{ transfers: [erc20(hash, 0, WALLET, CP, TOKEN_A, "AAA")] }],
+      "eth-mainnet:in": [{ transfers: [erc20(hash, 1, CP, WALLET, TOKEN_B, "BBB"), nativeLeg] }],
+    });
+    expect(out).toHaveLength(3);
+    expect(out.every((t) => t.payload.classification === "UNKNOWN")).toBe(true);
+    expect(out.every((t) => !("group_id" in t.payload))).toBe(true);
+  });
+
+  it("refuses to net when the residual is not smaller than the side it would reduce", async () => {
+    // A refund equal to (or larger than) the disposal is not a residual — netting would invent a
+    // zero/negative disposal, so the shape stays ambiguous instead of being guessed at.
+    const hash = "0x" + "a4".repeat(32);
+    const out = await run({
+      "eth-mainnet:out": [{ transfers: [erc20(hash, 0, WALLET, CP, TOKEN_A, "AAA", "0x2faf080")] }],
+      "eth-mainnet:in": [
+        {
+          transfers: [
+            erc20(hash, 1, CP, WALLET, TOKEN_B, "BBB"),
+            erc20(hash, 2, CP, WALLET, TOKEN_A, "AAA", "0x2faf080"),
+          ],
+        },
+      ],
+    });
+    expect(out).toHaveLength(3);
+    expect(out.every((t) => t.payload.classification === "UNKNOWN")).toBe(true);
+  });
+
+  it("leaves the Aave deposit direction (ETH -> aEthWETH) as the plain swap it already was", async () => {
+    const hash = "0x" + "a5".repeat(32);
+    const out = await run({
+      "eth-mainnet:out": [{ transfers: [{ ...nativeIn(hash, 0, BURNED), from: WALLET, to: GATEWAY }] }],
+      "eth-mainnet:in": [{ transfers: [erc20(hash, 1, MINT, WALLET, A_WETH, "aEthWETH", BURNED)] }],
+    });
+    expect(out).toHaveLength(2);
+    expect(out.find((t) => t.payload.direction === "OUT")!.payload.classification).toBe("EXCHANGE");
+    expect(out.find((t) => t.payload.direction === "IN")!.payload.classification).toBe("RECEIVE");
+    expect(out.every((t) => !("netted_leg_ids" in t.payload))).toBe(true);
+  });
+});
+
+describe("AlchemyAdapter forged outbound spam", () => {
+  // A scam ERC20 emits a Transfer whose `from` is the victim. Nothing left the wallet, but the row
+  // reads as a taxable SEND — and, worse, a forged leg sitting in a real transaction used to drag the
+  // genuine legs into an ambiguous mix.
+  const DENYLISTED = "0x09ff1d86683687f944dfda018c7870a869499481"; // "EꓔH", Ethereum
+  const POLYGON_FAKE_USDT = "0x248e1aaffcf66930d22f6bcc3e3b560d64c92678"; // "UЅDТ0", Polygon
+
+  it("tags a denylisted-contract OUT leg as SPAM instead of SEND", async () => {
+    const hash = "0x" + "b1".repeat(32);
+    const out = await run({
+      "eth-mainnet:out": [{ transfers: [erc20(hash, 0, WALLET, CP, DENYLISTED, "EꓔH")] }],
+    });
+    expect(out).toHaveLength(1);
+    expect(out[0].payload.classification).toBe("SPAM");
+    expect(out[0].payload.confidence).toBe(0);
+    // Direction and event type stay truthful — only the classification says what this is.
+    expect(out[0].payload.direction).toBe("OUT");
+    expect(out[0].eventType).toBe("transfer_out");
+  });
+
+  it("tags an OUT leg with a weaponized symbol as SPAM (the Polygon fake USDT)", async () => {
+    const hash = "0x" + "b2".repeat(32);
+    const out = await run({
+      "polygon-mainnet:out": [{ transfers: [erc20(hash, 0, WALLET, CP, POLYGON_FAKE_USDT, "UЅDТ0")] }],
+    });
+    expect(out.map((t) => t.payload.classification)).toEqual(["SPAM"]);
+  });
+
+  it("keeps a forged leg from poisoning the genuine swap in the same transaction", async () => {
+    const hash = "0x" + "b3".repeat(32);
+    const out = await run({
+      "eth-mainnet:out": [
+        {
+          transfers: [
+            erc20(hash, 0, WALLET, CP, TOKEN_A, "AAA"),
+            erc20(hash, 1, WALLET, CP, DENYLISTED, "EꓔH"),
+          ],
+        },
+      ],
+      "eth-mainnet:in": [{ transfers: [erc20(hash, 2, CP, WALLET, TOKEN_B, "BBB")] }],
+    });
+    // Without the pre-filter this is outAssets={A, scam} -> 3 UNKNOWN rows. The forged leg is set
+    // aside, so the genuine pair is still recognised, and the forged row is emitted rather than lost.
+    expect(out).toHaveLength(3);
+    expect(out.find((t) => t.payload.asset_contract === TOKEN_A)!.payload.classification).toBe("EXCHANGE");
+    expect(out.find((t) => t.payload.asset_contract === TOKEN_B)!.payload.classification).toBe("RECEIVE");
+    expect(out.find((t) => t.payload.asset_contract === DENYLISTED)!.payload.classification).toBe("SPAM");
+    const pair = out.filter((t) => t.payload.classification !== "SPAM");
+    expect(new Set(pair.map((t) => t.payload.group_id))).toEqual(new Set([`1:${hash}`]));
+    expect(out.find((t) => t.payload.classification === "SPAM")!.payload).not.toHaveProperty("group_id");
+  });
+
+  it("never tags a NATIVE leg as spam, however strange its symbol looks", async () => {
+    const outHash = "0x" + "b4".repeat(32);
+    const inHash = "0x" + "b5".repeat(32);
+    const out = await run({
+      "eth-mainnet:out": [{ transfers: [{ ...nativeIn(outHash, 0), from: WALLET, to: CP, asset: "⭐ETH claim .live" }] }],
+      "eth-mainnet:in": [{ transfers: [{ ...nativeIn(inHash, 0), asset: "⭐ETH claim .live" }] }],
+    });
+    expect(out.find((t) => t.payload.tx_hash === outHash)!.payload.classification).toBe("SEND");
+    expect(out.find((t) => t.payload.tx_hash === inHash)!.payload.classification).toBe("RECEIVE");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Graceful degradation when the trace method is not available to our API key.
+//
+// Observed live on a Free-tier key: HTTP 400 + JSON-RPC code -32600 with
+// "debug_traceTransaction is not available on the Free tier - upgrade to Pay As
+// You Go, or Enterprise for access." Treating that as a chain failure withheld
+// ALL of Arbitrum and Optimism, which is strictly worse than having no native
+// legs — the token and external legs were fine.
+// ---------------------------------------------------------------------------
+describe("AlchemyAdapter native tracing degradation (capability vs transient)", () => {
+  const ROUTER = "0x3333333333333333333333333333333333333333";
+  const TIER_MESSAGE =
+    "debug_traceTransaction is not available on the Free tier - upgrade to Pay As You Go, or Enterprise for access.";
+
+  const swapOut = (hash: string, log: number) => erc20(hash, log, WALLET, ROUTER, TOKEN_A, "USDC", "0x1312d00");
+
+  const warnings = () => {
+    const spy = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    return {
+      degradations: () => spy.mock.calls.filter((call) => String(call[0]).includes("native tracing unavailable")),
+      restore: () => spy.mockRestore(),
+    };
+  };
+
+  it("keeps the chain complete and its token legs when tracing is tier-blocked", async () => {
+    const hash = "0x" + "e1".repeat(32);
+    const log = warnings();
+    try {
+      const result = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(hash, 4)] }] },
+        { [hash]: { httpStatus: 400, error: { code: -32600, message: TIER_MESSAGE } } },
+      );
+
+      // The regression this guards: the chain must NOT be withheld.
+      expect(result.chainHeads[42161]).toBeDefined();
+      const arb = result.transactions.filter((t) => t.payload.chain_id === 42161);
+      expect(arb).toHaveLength(1);
+      expect(arb[0].payload.asset_type).toBe("ERC20");
+      expect(arb[0].payload.classification).toBe("SEND");
+      expect(arb.some((t) => t.payload.asset_type === "NATIVE")).toBe(false);
+
+      const degradations = log.degradations();
+      expect(degradations).toHaveLength(1);
+      expect(String(degradations[0][0])).toContain("arb-mainnet");
+      expect(String(degradations[0][0])).toContain(TIER_MESSAGE);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("stops tracing the remaining candidates once the chain is known to be blocked", async () => {
+    // Six candidates, TRACE_CONCURRENCY of 4: the first four start together and all learn the
+    // method is gated, so the last two are skipped instead of spending a request each to relearn it.
+    const hashes = ["f1", "f2", "f3", "f4", "f5", "f6"].map((byte) => "0x" + byte.repeat(32));
+    const traces = Object.fromEntries(
+      hashes.map((hash) => [hash, { httpStatus: 400, error: { code: -32600, message: TIER_MESSAGE } }]),
+    );
+    const calls: CallRecord[] = [];
+    const log = warnings();
+    try {
+      const result = await runTraced(
+        { "arb-mainnet:out": [{ transfers: hashes.map((hash, index) => swapOut(hash, index)) }] },
+        traces as Record<string, TraceSpec>,
+        calls,
+      );
+      expect(calls.filter((c) => c.direction === "trace")).toHaveLength(4);
+      expect(log.degradations()).toHaveLength(1);
+      // All six token legs still land; only the native recovery is missing.
+      expect(result.transactions.filter((t) => t.payload.chain_id === 42161)).toHaveLength(6);
+      expect(result.chainHeads[42161]).toBeDefined();
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("remembers the block for the process, so a later sync on the same adapter traces nothing", async () => {
+    const hash = "0x" + "e4".repeat(32);
+    const other = "0x" + "e5".repeat(32);
+    const calls: CallRecord[] = [];
+    const log = warnings();
+    try {
+      vi.stubGlobal(
+        "fetch",
+        makeFetch(
+          { "arb-mainnet:out": [{ transfers: [swapOut(hash, 4)] }, { transfers: [swapOut(other, 6)] }] },
+          calls,
+          {
+            [hash]: { httpStatus: 400, error: { code: -32600, message: TIER_MESSAGE } },
+            [other]: { httpStatus: 400, error: { code: -32600, message: TIER_MESSAGE } },
+          },
+        ),
+      );
+      const adapter = new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: "key", ALCHEMY_RETRY_BASE_MS: "1" }));
+      await adapter.fetchTransactions(WALLET);
+      const afterFirst = calls.filter((c) => c.direction === "trace").length;
+      expect(afterFirst).toBe(1);
+
+      const second = await adapter.fetchTransactions(WALLET);
+      expect(calls.filter((c) => c.direction === "trace")).toHaveLength(afterFirst); // no re-probe
+      expect(second.chainHeads[42161]).toBeDefined();
+      expect(log.degradations()).toHaveLength(1); // warned exactly once for this chain
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("degrades the same way on a bare -32601 method-not-found", async () => {
+    const hash = "0x" + "e6".repeat(32);
+    const log = warnings();
+    try {
+      const result = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(hash, 4)] }] },
+        { [hash]: { rpcError: "the method debug_traceTransaction does not exist/is not available", code: -32601 } },
+      );
+      expect(result.chainHeads[42161]).toBeDefined();
+      expect(result.transactions.filter((t) => t.payload.chain_id === 42161)).toHaveLength(1);
+      expect(log.degradations()).toHaveLength(1);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("degrades on a tier message even when the provider sends no error code", async () => {
+    const hash = "0x" + "e7".repeat(32);
+    const log = warnings();
+    try {
+      const result = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(hash, 4)] }] },
+        { [hash]: { rpcError: "trace is not available on the Growth tier" } },
+      );
+      expect(result.chainHeads[42161]).toBeDefined();
+      expect(log.degradations()).toHaveLength(1);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("still WITHHOLDS the chain on a transient trace failure", async () => {
+    const transient: Record<string, TraceSpec> = {
+      rpc: { rpcError: "execution timeout", code: -32000 },
+      http500: { httpStatus: 500 },
+      http503: { httpStatus: 503 },
+    };
+    for (const [name, failure] of Object.entries(transient)) {
+      const hash = "0x" + "e8".repeat(32);
+      const log = warnings();
+      try {
+        const result = await runTraced(
+          {
+            "arb-mainnet:out": [{ transfers: [swapOut(hash, 4)] }],
+            "base-mainnet:in": [{ transfers: [nativeIn("0x" + "e9".repeat(32))] }],
+          },
+          { [hash]: failure },
+        );
+        expect(result.chainHeads[42161], name).toBeUndefined();
+        expect(result.transactions.some((t) => t.payload.chain_id === 42161), name).toBe(false);
+        expect(result.chainHeads[8453], name).toBeDefined();
+        expect(log.degradations(), name).toHaveLength(0); // not a capability problem
+      } finally {
+        log.restore();
+      }
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The free-tier fallback behind the trace path (native-balance-diff.ts).
+//
+// On the live key `debug_traceTransaction` is rejected with -32600 "not available on the Free tier",
+// so the trace source recovers nothing and an Arbitrum USDC -> ETH swap still showed only the USDC
+// disposal. `eth_getBalance` either side of the transaction's block IS served on that tier, and the
+// wallet's balance change minus the parts already visible (its fee, the top-level value) is the
+// internal movement. These cover that second source and the hand-off between the two.
+// ---------------------------------------------------------------------------
+describe("AlchemyAdapter native-value recovery by balance diff (free-tier fallback)", () => {
+  const ROUTER = "0x3333333333333333333333333333333333333333";
+  const TIER_MESSAGE =
+    "debug_traceTransaction is not available on the Free tier - upgrade to Pay As You Go, or Enterprise for access.";
+  const tierBlocked = (...hashes: string[]): Record<string, TraceSpec> =>
+    Object.fromEntries(hashes.map((hash) => [hash, { httpStatus: 400, error: { code: -32600, message: TIER_MESSAGE } }]));
+
+  const swapOut = (hash: string, log = 4) => erc20(hash, log, WALLET, ROUTER, TOKEN_A, "USDC", "0x1312d00");
+
+  const logs = () => {
+    const warn = vi.spyOn(Logger.prototype, "warn").mockImplementation(() => undefined);
+    const debug = vi.spyOn(Logger.prototype, "debug").mockImplementation(() => undefined);
+    return {
+      degradations: (kind: string) => warn.mock.calls.filter((call) => String(call[0]).includes(kind)),
+      debugs: (fragment: string) => debug.mock.calls.filter((call) => String(call[0]).includes(fragment)),
+      restore: () => {
+        warn.mockRestore();
+        debug.mockRestore();
+      },
+    };
+  };
+
+  // The reported regression, end to end: the trace is gated, the balance diff recovers the ETH the
+  // router paid, and classifyGroup pairs it with the USDC disposal exactly as the trace path does.
+  it("turns the tier-blocked Arbitrum swap into an EXCHANGE/RECEIVE pair sharing one group_id", async () => {
+    const hash = "0x" + "b1".repeat(32);
+    const log = logs();
+    try {
+      const { transactions, chainHeads } = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] },
+        tierBlocked(hash),
+        [],
+        // Wallet sent the tx: balance rose 900 wei on top of the 6 wei of gas it paid.
+        { [hash]: { block: 300_000, from: WALLET, to: ROUTER, value: "0x0", gasUsed: "0x2", effectiveGasPrice: "0x3", before: "0x64", after: "0x3e8" } },
+      );
+
+      expect(chainHeads[42161]).toBeDefined();
+      const arb = transactions.filter((t) => t.payload.chain_id === 42161);
+      expect(arb).toHaveLength(2);
+      const disposal = arb.find((t) => t.payload.classification === "EXCHANGE")!;
+      const acquisition = arb.find((t) => t.payload.classification === "RECEIVE")!;
+
+      expect(disposal.payload.asset_type).toBe("ERC20");
+      expect(disposal.payload.direction).toBe("OUT");
+      expect(disposal.payload.raw_amount).toBe(String(BigInt("0x1312d00")));
+
+      expect(acquisition.eventType).toBe("transfer_in");
+      expect(acquisition.payload.asset_type).toBe("NATIVE");
+      expect(acquisition.payload.asset_contract).toBeNull();
+      expect(acquisition.payload.symbol).toBe("ETH");
+      expect(acquisition.payload.decimals).toBe(18);
+      expect(acquisition.payload.raw_amount).toBe("906"); // 1000 - 100 + gas 6
+      expect(acquisition.payload.counterparty).toBe(ROUTER);
+      expect(acquisition.payload.income_kind).toBeNull();
+
+      // The id says which source produced the leg and stays distinct from a `:internal:` trace id.
+      expect(acquisition.txHash).toBe(`42161:${hash}:balance:0`);
+      expect(acquisition.payload.id).toBe(`42161:${hash}:balance:0`);
+      expect(acquisition.payload.tx_hash).toBe(hash);
+      // Inferred, not observed: the marker is what tells the two apart after the fact.
+      expect(acquisition.payload.native_source).toBe("balance-diff");
+
+      expect(disposal.payload.group_id).toBe(`42161:${hash}`);
+      expect(acquisition.payload.group_id).toBe(disposal.payload.group_id);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("never touches the balance RPCs while the trace source answers, and leaves traced legs unmarked", async () => {
+    const hash = "0x" + "b2".repeat(32);
+    const calls: CallRecord[] = [];
+    const { transactions } = await runTraced(
+      { "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] },
+      {
+        [hash]: {
+          root: {
+            type: "CALL",
+            from: WALLET,
+            to: ROUTER,
+            value: "0x0",
+            calls: [{ type: "CALL", from: ROUTER, to: WALLET, value: "0x1683b9ce8000" }],
+          },
+        },
+      },
+      calls,
+      { [hash]: { block: 300_001, from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" } },
+    );
+    expect(calls.filter((c) => c.direction === "trace")).toHaveLength(1);
+    expect(calls.filter((c) => ["receipt", "tx", "balance"].includes(c.direction))).toHaveLength(0);
+    const native = transactions.find((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")!;
+    expect(native.txHash).toBe(`42161:${hash}:internal:0`);
+    expect(native.payload.native_source).toBeUndefined();
+  });
+
+  it("does not fall through when the trace source answers with NO movements", async () => {
+    // An available trace saying "nothing internal happened" is the truth, not a reason to go and
+    // re-derive a net from balances that would disagree with it.
+    const hash = "0x" + "b3".repeat(32);
+    const calls: CallRecord[] = [];
+    const { transactions } = await runTraced(
+      { "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] },
+      {},
+      calls,
+      { [hash]: { block: 300_002, from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" } },
+    );
+    expect(calls.filter((c) => c.direction === "trace")).toHaveLength(1);
+    expect(calls.filter((c) => c.direction === "receipt")).toHaveLength(0);
+    expect(transactions.filter((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")).toHaveLength(0);
+  });
+
+  it("withholds the chain on a TRANSIENT trace failure instead of falling through to the weaker source", async () => {
+    for (const failure of [{ httpStatus: 500 }, { rpcError: "execution timeout", code: -32000 }] as const) {
+      const hash = "0x" + "b4".repeat(32);
+      const calls: CallRecord[] = [];
+      const result = await runTraced(
+        {
+          "arb-mainnet:out": [{ transfers: [swapOut(hash)] }],
+          "base-mainnet:in": [{ transfers: [nativeIn("0x" + "b5".repeat(32))] }],
+        },
+        { [hash]: failure },
+        calls,
+        { [hash]: { block: 300_003, from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" } },
+      );
+      expect(result.chainHeads[42161]).toBeUndefined();
+      expect(calls.filter((c) => c.direction === "receipt")).toHaveLength(0);
+      expect(result.chainHeads[8453]).toBeDefined();
+    }
+  });
+
+  it("spends exactly four RPCs per candidate, reading the balance at block-1 and at block", async () => {
+    const hash = "0x" + "b6".repeat(32);
+    const calls: CallRecord[] = [];
+    const log = logs();
+    try {
+      await runTraced({ "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] }, tierBlocked(hash), calls, {
+        [hash]: { block: 0x4d2, from: WALLET, to: ROUTER, gasUsed: "0x2", effectiveGasPrice: "0x3", before: "0x64", after: "0x3e8" },
+      });
+      const diffCalls = calls.filter((c) => ["receipt", "tx", "balance"].includes(c.direction));
+      expect(diffCalls).toHaveLength(4);
+      expect(diffCalls.filter((c) => c.direction === "balance").map((c) => c.params.tag)).toEqual(["0x4d1", "0x4d2"]);
+      expect(diffCalls.every((c) => c.network === "arb-mainnet")).toBe(true);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("emits no leg when the balance moved by exactly the amounts already visible", async () => {
+    // An approve: the only balance change is the fee the wallet paid, which is not a transfer.
+    const hash = "0x" + "b7".repeat(32);
+    const log = logs();
+    try {
+      const { transactions } = await runTraced({ "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] }, tierBlocked(hash), [], {
+        [hash]: { block: 300_004, from: WALLET, to: ROUTER, gasUsed: "0x3", effectiveGasPrice: "0x4", before: "0x64", after: "0x58" },
+      });
+      const arb = transactions.filter((t) => t.payload.chain_id === 42161);
+      expect(arb).toHaveLength(1);
+      expect(arb[0].payload.asset_type).toBe("ERC20");
+      expect(arb[0].payload.classification).toBe("SEND");
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("emits an OUT leg when an internal call took native OUT of the wallet", async () => {
+    const hash = "0x" + "b8".repeat(32);
+    const log = logs();
+    try {
+      const { transactions } = await runTraced({ "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] }, tierBlocked(hash), [], {
+        // Balance fell by the 6 wei fee plus 750 wei the contract pulled out.
+        [hash]: { block: 300_005, from: WALLET, to: ROUTER, gasUsed: "0x2", effectiveGasPrice: "0x3", before: "0x3e8", after: "0xf4" },
+      });
+      const native = transactions.find((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")!;
+      expect(native.payload.direction).toBe("OUT");
+      expect(native.eventType).toBe("transfer_out");
+      expect(native.payload.raw_amount).toBe("750");
+      expect(native.payload.counterparty).toBe(ROUTER);
+      expect(native.payload.classification).toBe("SEND");
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("skips a reverted transaction, whose state changes were all rolled back", async () => {
+    const hash = "0x" + "b9".repeat(32);
+    const calls: CallRecord[] = [];
+    const log = logs();
+    try {
+      const { transactions } = await runTraced({ "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] }, tierBlocked(hash), calls, {
+        [hash]: { block: 300_006, status: "0x0", from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" },
+      });
+      expect(transactions.filter((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")).toHaveLength(0);
+      // Disqualified on the receipt alone: no transaction or balance reads are spent on it.
+      expect(calls.filter((c) => c.direction === "receipt")).toHaveLength(1);
+      expect(calls.filter((c) => ["tx", "balance"].includes(c.direction))).toHaveLength(0);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("skips a block holding two candidate transactions, because the diff cannot say which moved what", async () => {
+    const first = "0x" + "ba".repeat(32);
+    const second = "0x" + "bb".repeat(32);
+    const calls: CallRecord[] = [];
+    const log = logs();
+    try {
+      const { transactions, chainHeads } = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(first, 1), swapOut(second, 2)] }] },
+        tierBlocked(first, second),
+        calls,
+        {
+          [first]: { block: 300_007, from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" },
+          [second]: { block: 300_007, from: WALLET, to: ROUTER, before: "0x64", after: "0x3e8" },
+        },
+      );
+      expect(transactions.filter((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")).toHaveLength(0);
+      // Both token legs still land; only the inference is withheld, and it is said once.
+      expect(transactions.filter((t) => t.payload.chain_id === 42161)).toHaveLength(2);
+      expect(chainHeads[42161]).toBeDefined();
+      expect(calls.filter((c) => ["tx", "balance"].includes(c.direction))).toHaveLength(0);
+      expect(log.debugs("attribution ambiguous")).toHaveLength(1);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("reproduces identical ids on a re-sync, so the balance-diff path is idempotent", async () => {
+    const hash = "0x" + "bc".repeat(32);
+    const map = { "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] };
+    const states = {
+      [hash]: { block: 300_008, from: WALLET, to: ROUTER, gasUsed: "0x2", effectiveGasPrice: "0x3", before: "0x64", after: "0x3e8" },
+    };
+    const log = logs();
+    try {
+      const key = (result: Awaited<ReturnType<typeof runTraced>>) =>
+        result.transactions.map((t) => `${t.txHash}|${t.eventType}|${t.payload.raw_amount}|${t.payload.group_id}`);
+      const first = await runTraced(map, tierBlocked(hash), [], states);
+      const second = await runTraced(map, tierBlocked(hash), [], states);
+      expect(key(second)).toEqual(key(first));
+      expect(key(first).some((entry) => entry.includes(`42161:${hash}:balance:0`))).toBe(true);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("withholds the WHOLE chain when a balance-diff read fails transiently", async () => {
+    const hash = "0x" + "bd".repeat(32);
+    const log = logs();
+    try {
+      const result = await runTraced(
+        {
+          "arb-mainnet:out": [{ transfers: [swapOut(hash)] }],
+          "base-mainnet:in": [{ transfers: [nativeIn("0x" + "be".repeat(32))] }],
+        },
+        tierBlocked(hash),
+        [],
+        { [hash]: { block: 300_009, from: WALLET, to: ROUTER, receiptFailure: { message: "execution timeout", code: -32000 } } },
+      );
+      expect(result.chainHeads[42161]).toBeUndefined();
+      expect(result.transactions.some((t) => t.payload.chain_id === 42161)).toBe(false);
+      expect(result.chainHeads[8453]).toBeDefined();
+      expect(log.degradations("native balance-diff unavailable")).toHaveLength(0);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("keeps the chain when the balance reads themselves are gated, warning once", async () => {
+    // Both sources gone: the token legs are still complete and correct on their own, and withholding
+    // the chain over a permanent capability gap would be strictly worse.
+    const hash = "0x" + "bf".repeat(32);
+    const log = logs();
+    try {
+      const result = await runTraced({ "arb-mainnet:out": [{ transfers: [swapOut(hash)] }] }, tierBlocked(hash), [], {
+        [hash]: {
+          block: 300_010,
+          from: WALLET,
+          to: ROUTER,
+          balanceFailure: { httpStatus: 400, code: -32600, message: "archive state is not available on the Free tier" },
+        },
+      });
+      expect(result.chainHeads[42161]).toBeDefined();
+      const arb = result.transactions.filter((t) => t.payload.chain_id === 42161);
+      expect(arb).toHaveLength(1);
+      expect(arb[0].payload.asset_type).toBe("ERC20");
+      expect(log.degradations("native balance-diff unavailable")).toHaveLength(1);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("counts the OP-stack L1 fee the sender also paid, so Optimism does not under-report", async () => {
+    // On Arbitrum Nitro the L1 cost is folded into gasUsed, but an OP-stack receipt bills it
+    // separately; missing it would shrink every recovered payout by that amount.
+    const hash = "0x" + "c1".repeat(32);
+    const log = logs();
+    try {
+      const { transactions } = await runTraced(
+        { "opt-mainnet:out": [{ transfers: [swapOut(hash)] }] },
+        tierBlocked(hash),
+        [],
+        {
+          [hash]: { block: 300_011, from: WALLET, to: ROUTER, gasUsed: "0x2", effectiveGasPrice: "0x3", l1Fee: "0x14", before: "0x64", after: "0x3e8" },
+        },
+      );
+      const native = transactions.find((t) => t.payload.chain_id === 10 && t.payload.asset_type === "NATIVE")!;
+      expect(native.txHash).toBe(`10:${hash}:balance:0`);
+      expect(native.payload.raw_amount).toBe("926"); // 900 + gas 6 + l1Fee 20
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("subtracts a top-level value the wallet RECEIVED, leaving only the internal part", async () => {
+    // Someone sent the wallet ETH top-level (already an `external` leg) and a contract paid it more.
+    const hash = "0x" + "c2".repeat(32);
+    const log = logs();
+    try {
+      const { transactions } = await runTraced(
+        { "arb-mainnet:in": [{ transfers: [erc20(hash, 3, CP, WALLET, TOKEN_B, "BBB")] }] },
+        tierBlocked(hash),
+        [],
+        { [hash]: { block: 300_012, from: CP, to: WALLET, value: "0x1f4", before: "0x3e8", after: "0x6a4" } },
+      );
+      const native = transactions.find((t) => t.payload.chain_id === 42161 && t.payload.asset_type === "NATIVE")!;
+      expect(native.payload.direction).toBe("IN");
+      // 1700 - 1000 = 700 moved, of which 500 is the top-level value already collected elsewhere.
+      expect(native.payload.raw_amount).toBe("200");
+      // `to` is the wallet itself, so there is no counterparty address to name.
+      expect(native.payload.counterparty).toBe("0x0000000000000000000000000000000000000000");
+    } finally {
+      log.restore();
+    }
   });
 });

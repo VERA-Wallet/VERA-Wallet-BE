@@ -8,6 +8,7 @@ import type { TransactionRepository } from "./transaction.repository";
 // Canonical contracts the linker recognizes (native has none).
 const USDT_POLYGON = "0xc2132d05d31c914a87c6611c10748aeb04b58e8f";
 const USDT_ETH = "0xdac17f958d2ee523a2206206994597c13d831ec7";
+const USDC_ETH = "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48";
 const WETH_OP = "0x4200000000000000000000000000000000000006";
 
 type LegSpec = {
@@ -179,6 +180,79 @@ describe("BridgeLinkingService.linkForUser", () => {
     const gid = (await byId(repo, "out")).payload.bridge_group_id;
     expect(await service.linkForUser(USER)).toBe(0); // no-op on repeat
     expect((await byId(repo, "out")).payload.bridge_group_id).toBe(gid);
+  });
+
+  // --- cross-asset (bridge + swap) -------------------------------------------------------------
+  // A bridge aggregator that routes through a pool pays out the OTHER stablecoin on the destination
+  // chain. That conversion is a DISPOSAL, so the pair is booked EXCHANGE + RECEIVE, not as a move.
+  describe("cross-asset canonical stablecoin pair", () => {
+    // The observed Mayan route: 17.26924 USDT on Polygon -> 15.941987 USDC on Ethereum, ~30s later.
+    const usdtOut = () =>
+      leg({ id: "out", chain: 137, dir: "OUT", symbol: "USDT", raw: "17269240", ts: "2025-11-20T00:00:00Z", assetType: "ERC20", contract: USDT_POLYGON, bridgeSuspected: true });
+    const usdcIn = (raw = "15941987") =>
+      leg({ id: "in", chain: 1, dir: "IN", symbol: "USDC", raw, ts: "2025-11-20T00:00:30Z", assetType: "ERC20", contract: USDC_ETH });
+
+    it("links USDT(Polygon) -> USDC(Ethereum) as a disposal: OUT EXCHANGE, IN RECEIVE, shared key", async () => {
+      const { repo, service } = await seed(usdtOut(), usdcIn());
+      expect(await service.linkForUser(USER)).toBe(1);
+      const out = await byId(repo, "out");
+      const inLeg = await byId(repo, "in");
+      // The conversion is taxable, so the OUT stays a disposal and the IN anchors the new cost basis.
+      expect(out.payload.classification).toBe("EXCHANGE");
+      expect(inLeg.payload.classification).toBe("RECEIVE");
+      expect(out.payload.confidence).toBe(0.9);
+      expect(inLeg.payload.confidence).toBe(0.9);
+      // Linked for display/provenance only. bridge_group_id moves cost between pools ONLY together
+      // with INTERNAL_TRANSFER (cost-basis.ts bridgeGroupOf), so the disposal is still charged.
+      expect(out.payload.bridge_group_id).toBe("bridge:137:0xout");
+      expect(inLeg.payload.bridge_group_id).toBe(out.payload.bridge_group_id);
+      expect(out.payload.bridge_dest_chain_id).toBe(1);
+      // group_id would make the tax engine collapse the two chains to a single gas target.
+      expect(out.payload.group_id ?? null).toBeNull();
+      expect(inLeg.payload.group_id ?? null).toBeNull();
+    });
+
+    it("NEVER links a spoofed USDC contract - symbol alone can claim anything", async () => {
+      const { repo, service } = await seed(
+        usdtOut(),
+        leg({ id: "in", chain: 1, dir: "IN", symbol: "USDC", raw: "15941987", ts: "2025-11-20T00:00:30Z", assetType: "ERC20", contract: "0x000000000000000000000000000000000000dead" }),
+      );
+      expect(await service.linkForUser(USER)).toBe(0);
+      expect((await byId(repo, "out")).payload.classification).toBe("SEND");
+    });
+
+    it("does NOT cross assets that are not both canonical USD stables (ETH -> USDC)", async () => {
+      const { service } = await seed(ethOut("out", 1, eth(10), "2025-01-01T00:00:00Z"), usdcIn("100000"));
+      expect(await service.linkForUser(USER)).toBe(0);
+    });
+
+    it("keeps the same fee band for a cross-asset pair (no loosening for the same-asset case)", async () => {
+      // 12.0 / 17.26924 = 69.5%, below the 80% floor -> not a pair.
+      const { service } = await seed(usdtOut(), usdcIn("12000000"));
+      expect(await service.linkForUser(USER)).toBe(0);
+    });
+
+    it("is idempotent and stays EXCHANGE/RECEIVE on a repeat run", async () => {
+      const { repo, service } = await seed(usdtOut(), usdcIn());
+      expect(await service.linkForUser(USER)).toBe(1);
+      expect(await service.linkForUser(USER)).toBe(0);
+      expect((await byId(repo, "out")).payload.classification).toBe("EXCHANGE");
+      expect((await byId(repo, "in")).payload.classification).toBe("RECEIVE");
+    });
+  });
+
+  it("never steals a leg the own-wallet pass already linked (own: keys are off limits)", async () => {
+    const { repo, service } = await seed(
+      ethOut("out", 1, eth(10), "2025-01-01T00:00:00Z"),
+      leg({ id: "in", chain: 10, dir: "IN", symbol: "ETH", raw: eth(10), ts: "2025-01-01T00:00:16Z", cls: "INTERNAL_TRANSFER" }),
+    );
+    // Mark the IN as an own-wallet move, the way own-wallet-linking.service.ts would have.
+    const inLeg = await byId(repo, "in");
+    await repo.updatePayload(USER, "in", { ...inLeg.payload, bridge_group_id: "own:10:0xin:3" });
+
+    expect(await service.linkForUser(USER)).toBe(0);
+    expect((await byId(repo, "in")).payload.bridge_group_id).toBe("own:10:0xin:3");
+    expect((await byId(repo, "out")).payload.classification).toBe("SEND");
   });
 
   it("self-heals a one-sided (orphaned) link: a mid-pair write failure is repaired on the next run", async () => {

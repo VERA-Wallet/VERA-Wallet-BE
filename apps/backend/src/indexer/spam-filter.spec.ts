@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { CONTRACT_ALLOWLIST, SPAM_CONTRACT_DENYLIST, isInboundSpam, isWeaponizedSymbol } from "./spam-filter";
+import { CONTRACT_ALLOWLIST, SPAM_CONTRACT_DENYLIST, isInboundSpam, isWeaponizedSymbol, isNativeImpersonation } from "./spam-filter";
 
 describe("isWeaponizedSymbol", () => {
   it("accepts real short ASCII tickers, including the UNKNOWN placeholder", () => {
@@ -22,6 +22,8 @@ describe("isWeaponizedSymbol", () => {
 
   it("flags non-ASCII homoglyph impersonation", () => {
     expect(isWeaponizedSymbol("EꓔH")).toBe(true); // ꓔ is a Lisu letter, not Latin T
+    expect(isWeaponizedSymbol("UЅDТ0")).toBe(true); // Cyrillic Ѕ and Т, not Latin S and T
+    expect(isWeaponizedSymbol("UЅDТ")).toBe(true);
   });
 
   it("flags absurdly long symbols", () => {
@@ -54,9 +56,36 @@ describe("isInboundSpam", () => {
     expect(isInboundSpam({ assetType: "ERC20", symbol: "GOOD", assetContract: denylisted.toUpperCase() })).toBe(true);
   });
 
+  it("keeps the observed forged-outbound contracts on the denylist", () => {
+    // These three emit Transfer events whose `from` is the victim, so they show up on the OUT side
+    // as invented disposals. classifyGroup reads the denylist in BOTH directions.
+    for (const contract of [
+      "0x09ff1d86683687f944dfda018c7870a869499481", // "EꓔH", Ethereum
+      "0x248e1aaffcf66930d22f6bcc3e3b560d64c92678", // "UЅDТ0", Polygon
+      "0x93e58aa4d8f8f9cfb02ca3d1fa5332d55006252c", // "UЅDТ", Polygon
+    ]) {
+      expect(SPAM_CONTRACT_DENYLIST.has(contract)).toBe(true);
+      expect(isInboundSpam({ assetType: "ERC20", symbol: "USDT", assetContract: contract })).toBe(true);
+    }
+  });
+
   it("rescues an allowlisted contract from every heuristic", () => {
     const allowed = [...CONTRACT_ALLOWLIST][0];
     // Even an NFT asset type is rescued when the contract is explicitly trusted.
     expect(isInboundSpam({ assetType: "ERC721", symbol: "", assetContract: allowed })).toBe(false);
+  });
+});
+
+describe("native impersonation", () => {
+  it("flags an ERC20 whose ticker is the bare native symbol, in any case", () => {
+    expect(isNativeImpersonation("ERC20", "ETH")).toBe(true);
+    expect(isNativeImpersonation("ERC20", " eth ")).toBe(true);
+    expect(isInboundSpam({ assetType: "ERC20", symbol: "ETH", assetContract: "0x00000000000000000000000000000000000000aa" })).toBe(true);
+  });
+  it("never flags the native coin itself, wrapped ETH, or real POL/MATIC tokens", () => {
+    expect(isNativeImpersonation("NATIVE", "ETH")).toBe(false);
+    expect(isNativeImpersonation("ERC20", "WETH")).toBe(false);
+    expect(isNativeImpersonation("ERC20", "POL")).toBe(false);
+    expect(isNativeImpersonation("ERC20", "MATIC")).toBe(false);
   });
 });

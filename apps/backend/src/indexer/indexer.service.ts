@@ -13,6 +13,7 @@ import { CHAIN_INDEXER, SYNC_CURSOR_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } fr
 import { PriceEnrichmentService } from "./price-enrichment.service";
 import { HistoricalPriceEnrichmentService } from "./historical-price-enrichment.service";
 import { BridgeLinkingService } from "./bridge-linking.service";
+import { OwnWalletLinkingService } from "./own-wallet-linking.service";
 
 type SyncMode = "subset" | "all";
 type SkipEntry = { bindingId: string; chainId?: number; code: string; message?: string };
@@ -40,6 +41,7 @@ export class IndexerService {
     private readonly pricing: PriceEnrichmentService,
     private readonly historicalPricing: HistoricalPriceEnrichmentService,
     private readonly bridgeLinking: BridgeLinkingService,
+    private readonly ownWalletLinking: OwnWalletLinkingService,
   ) {}
 
   /** Forced incremental refresh across ALL bindings (manual resync + legacy /indexer/sync). */
@@ -86,7 +88,18 @@ export class IndexerService {
       // A forced 'all' call may ride an in-flight 'all', but must NEVER be satisfied by a 'subset'
       // bootstrap (it would omit already-synced bindings). Wait for the subset to settle, then run 'all'.
       if (existing.mode === "all") return existing.promise;
-      return existing.promise.catch(() => undefined).then(() => this.coalesce(userId, "all", work));
+      // The in-flight run is a 'subset' bootstrap -- almost always the read-path's first-import gate
+      // that fired just before this forced call (e.g. the dashboard's first read right after the user
+      // registers a wallet). Wait for it, then run 'all' for the fresh cursors it just advanced. But the
+      // 'all' pass alone would report near-zero: its cursors start where the subset just left them, so it
+      // only sees the tiny post-bootstrap delta. The user's resync toast/modal must reflect what THEIR
+      // import actually brought in, not just that delta -- so merge the subset's totals into the forced
+      // pass's result. A rejected subset carries nothing to merge, so on failure we keep today's behavior:
+      // swallow it and report the 'all' pass alone.
+      return existing.promise.then(
+        (subsetResult) => this.coalesce(userId, "all", work).then((allResult) => this.mergeSyncResults(subsetResult, allResult)),
+        () => this.coalesce(userId, "all", work),
+      );
     }
     const entry: { mode: SyncMode; promise: Promise<SyncResult> } = { mode, promise: Promise.resolve({ bindings: 0, fetched: 0, normalized: 0, chains: [], skipped: [] }) };
     // Insert synchronously (no await between create and set); clean up in finally only if still mapped.
@@ -95,6 +108,31 @@ export class IndexerService {
     });
     this.inflight.set(userId, entry);
     return entry.promise;
+  }
+
+  // Merges a settled subset (bootstrap) result into the forced 'all' pass that waited on it. `all`'s
+  // binding count wins (subset bindings are always a subset of all's), everything else additive.
+  private mergeSyncResults(subset: SyncResult, all: SyncResult): SyncResult {
+    const chainTotals = new Map<number, number>();
+    for (const entry of subset.chains) chainTotals.set(entry.chainId, (chainTotals.get(entry.chainId) ?? 0) + entry.fetched);
+    for (const entry of all.chains) chainTotals.set(entry.chainId, (chainTotals.get(entry.chainId) ?? 0) + entry.fetched);
+
+    const seenSkips = new Set<string>();
+    const skipped: SkipEntry[] = [];
+    for (const entry of [...subset.skipped, ...all.skipped]) {
+      const key = `${entry.bindingId}:${entry.chainId ?? ""}:${entry.code}`;
+      if (seenSkips.has(key)) continue;
+      seenSkips.add(key);
+      skipped.push(entry);
+    }
+
+    return {
+      bindings: all.bindings,
+      fetched: subset.fetched + all.fetched,
+      normalized: subset.normalized + all.normalized,
+      chains: SUPPORTED_CHAIN_IDS.map((chainId) => ({ chainId, fetched: chainTotals.get(chainId) ?? 0 })),
+      skipped,
+    };
   }
 
   private async runSync(userId: string, bindings: BindingRecord[]): Promise<SyncResult> {
@@ -141,6 +179,22 @@ export class IndexerService {
         const stored = await this.transactions.save(binding.id, userId, withHashes);
         normalized += stored.length;
 
+        // Re-normalization can move a leg to another eventType (UNKNOWN transfer_out -> EXCHANGE swap)
+        // or fold it into a neighbouring leg's row (netted_leg_ids). The storage key is
+        // (binding, txHash, eventType), so the upsert above writes the NEW row and leaves the old one
+        // behind — the FE then shows the corrected event AND a ghost 미분류 row next to it. This purge
+        // is keyed ONLY on legs that were positively re-emitted just now, never on a block range, so a
+        // partial fetch can never wipe real history. Guarded: it must not fail an otherwise-good sync.
+        try {
+          await this.transactions.deleteSupersededRows(binding.id, userId, stored.map((row) => ({
+            id: row.txHash,
+            eventType: row.eventType,
+            nettedLegIds: Array.isArray(row.payload.netted_leg_ids) ? row.payload.netted_leg_ids.map(String) : [],
+          })));
+        } catch (error) {
+          skipped.push({ bindingId: binding.id, code: "superseded_purge_failed", message: sanitize((error as Error).message) });
+        }
+
         // Advance cursors ONLY for completely-observed chains; hold + report the rest.
         for (const chainId of SUPPORTED_CHAIN_IDS) {
           const head = chainHeads[chainId];
@@ -171,6 +225,9 @@ export class IndexerService {
     // full multi-chain dataset (a bridge's destination IN may live on a different binding/chain).
     // Best-effort: a linking failure must never fail an otherwise-successful sync.
     try {
+      // Own-wallet linking runs FIRST and claims every leg it can prove is a same-user move, so
+      // bridge linking (which skips `own:` keys) can never re-link one of them on a lucky amount.
+      await this.ownWalletLinking.linkForUser(userId);
       await this.bridgeLinking.linkForUser(userId);
     } catch (error) {
       skipped.push({ bindingId: bindings[0]?.id ?? "", code: "bridge_linking_failed", message: sanitize((error as Error).message) });

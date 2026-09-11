@@ -11,6 +11,7 @@ import { HistoricalPriceEnrichmentService } from "./historical-price-enrichment.
 import { MockHistoricalPriceOracle } from "./historical-price-oracle";
 import { MockHistoricalPriceRepository } from "./historical-price.repository.adapters";
 import { BridgeLinkingService } from "./bridge-linking.service";
+import { OwnWalletLinkingService } from "./own-wallet-linking.service";
 
 const ALL_HEADS: Record<number, number> = { 1: 100, 8453: 100, 42161: 100, 10: 100, 137: 100 };
 
@@ -52,7 +53,8 @@ async function harness(impl?: (address: string, since?: Record<number, bigint>) 
   const pricing = new PriceEnrichmentService(new MockPriceOracle());
   const historicalPricing = new HistoricalPriceEnrichmentService(new MockHistoricalPriceOracle(), new MockHistoricalPriceRepository());
   const bridgeLinking = new BridgeLinkingService(transactions);
-  const service = new IndexerService(indexer, wallets, transactions, anchor as never, anchor as never, cursors, pricing, historicalPricing, bridgeLinking);
+  const ownWalletLinking = new OwnWalletLinkingService(transactions, wallets);
+  const service = new IndexerService(indexer, wallets, transactions, anchor as never, anchor as never, cursors, pricing, historicalPricing, bridgeLinking, ownWalletLinking);
   return { service, indexerFn, wallets, transactions, cursors, anchor };
 }
 
@@ -131,6 +133,78 @@ describe("IndexerService coalescing", () => {
     // The forced run must cover BOTH wallets, not just the subset's B.
     expect(scanned).toContain("0xWA");
     expect(scanned).toContain("0xWB");
+  });
+
+  it("merges the in-flight subset bootstrap's totals into the forced resync result", async () => {
+    // Reproduces the real flow: registering a wallet redirects to the dashboard, whose first
+    // read fires ensureInitialSync (subset) for the never-synced binding; almost simultaneously
+    // the FE import tracker posts the forced resync. Cursors advance during the subset pass, so
+    // the 'all' pass alone would report near-zero even though the subset just imported the wallet.
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const h = await harness(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await gate; // hold the subset bootstrap call
+        return { transactions: [evt(0), evt(1)], chainHeads: { ...ALL_HEADS } }; // the actual import
+      }
+      return { transactions: [], chainHeads: { ...ALL_HEADS } }; // 'all' pass: cursors already advanced
+    });
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+
+    const subset = h.service.ensureInitialSync("u1");
+    const forced = h.service.sync("u1");
+    release();
+    const [, forcedResult] = await Promise.all([subset, forced]);
+
+    expect(forcedResult.bindings).toBe(1);
+    expect(forcedResult.fetched).toBe(2); // subset's 2 events, not the all-pass's 0
+    expect(forcedResult.normalized).toBe(2);
+    expect(forcedResult.chains).toEqual([
+      { chainId: 1, fetched: 2 },
+      { chainId: 8453, fetched: 0 },
+      { chainId: 42161, fetched: 0 },
+      { chainId: 10, fetched: 0 },
+      { chainId: 137, fetched: 0 },
+    ]);
+    expect(forcedResult.skipped).toEqual([]);
+  });
+
+  it("returns the plain all-pass result unchanged when no subset bootstrap is in flight", async () => {
+    const h = await harness(async () => ({ transactions: [evt(0)], chainHeads: { ...ALL_HEADS } }));
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    const result = await h.service.sync("u1"); // no concurrent subset -> takes the plain-entry path
+    expect(result.bindings).toBe(1);
+    expect(result.fetched).toBe(1); // not doubled by an accidental merge
+    expect(result.normalized).toBe(1);
+    expect(result.chains.find((c) => c.chainId === 1)?.fetched).toBe(1);
+  });
+
+  it("does not let a REJECTED in-flight subset poison the forced resync's result (AC13 failure path)", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    let calls = 0;
+    const h = await harness(async () => {
+      calls += 1;
+      if (calls === 1) {
+        await gate;
+        throw new Error("subset bootstrap outage"); // the subset run fails outright
+      }
+      return { transactions: [evt(0)], chainHeads: { ...ALL_HEADS } }; // the 'all' pass succeeds
+    });
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+
+    const subset = h.service.ensureInitialSync("u1");
+    subset.catch(() => undefined); // expected to reject; asserted separately below
+    const forced = h.service.sync("u1");
+    release();
+
+    await expect(subset).rejects.toBeInstanceOf(ServiceUnavailableException); // sole binding failed -> total outage
+    const forcedResult = await forced; // must resolve using only the 'all' pass, not throw or merge garbage
+    expect(forcedResult.bindings).toBe(1);
+    expect(forcedResult.fetched).toBe(1);
+    expect(forcedResult.normalized).toBe(1);
   });
 });
 
