@@ -252,12 +252,12 @@ export class PortfolioHoldingsService {
   private async priceAssets(assets: ResolvedAsset[]): Promise<PricedAsset[]> {
     const cache = new Map<string, Promise<TokenMarket | null>>();
     const priced = await mapWithConcurrency(assets, LOOKUP_CONCURRENCY, async (asset) => {
-      const contract = asset.assetType === "NATIVE" ? wrappedNativeOf(asset.chainId) : asset.contract;
-      if (!contract) return { ...asset, market: null };
-      const key = `${asset.chainId}:${contract}`;
+      const source = asset.assetType === "NATIVE" ? nativePriceSourceOf(asset.chainId) : asset.contract ? { chainId: asset.chainId, contract: asset.contract } : null;
+      if (!source) return { ...asset, market: null };
+      const key = `${source.chainId}:${source.contract}`;
       let lookup = cache.get(key);
       if (!lookup) {
-        lookup = this.safeLookup(asset.chainId, contract);
+        lookup = this.safeLookup(source.chainId, source.contract);
         cache.set(key, lookup);
       }
       return { ...asset, market: await lookup };
@@ -288,8 +288,17 @@ function registryEntryOf(chainId: number): ChainRegistryEntry | undefined {
   return CHAIN_REGISTRY.find((entry) => entry.chainId === chainId);
 }
 
-function wrappedNativeOf(chainId: number): string | null {
-  return registryEntryOf(chainId)?.wrappedNativeContract ?? null;
+/**
+ * 네이티브 코인의 시세를 읽을 (체인, 래핑 컨트랙트). 같은 네이티브 심볼(ETH·POL)은 체인이 달라도 같은 자산이므로
+ * 레지스트리에서 그 심볼이 **처음** 나오는 체인(ETH → Ethereum, POL → Polygon)의 래핑 토큰으로 한 번만 조회한다.
+ * 체인별로 따로 읽으면 Base·Optimism처럼 WETH 주소가 같은 체인에서 DexScreener 응답(상위 30개 페어)이
+ * 한쪽 체인 페어로만 채워져 다른 쪽이 "시장 없음"이 된다(2026-09-11 실지갑에서 Optimism ETH가 no_market).
+ */
+function nativePriceSourceOf(chainId: number): { chainId: number; contract: string } | null {
+  const own = registryEntryOf(chainId);
+  if (!own) return null;
+  const home = CHAIN_REGISTRY.find((entry) => entry.nativeSymbol === own.nativeSymbol) ?? own;
+  return home.wrappedNativeContract ? { chainId: home.chainId, contract: home.wrappedNativeContract } : null;
 }
 
 /** Sum the same asset across every bound wallet; union the skipped and truncated chains. */

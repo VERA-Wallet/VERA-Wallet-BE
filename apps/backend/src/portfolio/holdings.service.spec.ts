@@ -188,6 +188,22 @@ describe("PortfolioHoldingsService.holdings", () => {
     expect(eth.priceStatus).toBe("unknown");
   });
 
+  it("prices every ETH-native chain through mainnet WETH once (Base/Optimism share a WETH address that starves DexScreener's per-chain filter)", async () => {
+    const { service, lookup } = makeService({
+      snapshots: { [WALLET_A]: { chains: [
+        { chainId: 10, nativeRaw: 1_000_000_000_000_000_000n, tokens: [] },
+        { chainId: 8453, nativeRaw: 1_000_000_000_000_000_000n, tokens: [] },
+        { chainId: 137, nativeRaw: 1_000_000_000_000_000_000n, tokens: [] },
+      ], skippedChainIds: [], truncatedChainIds: [] } },
+      markets: { [`1:${WETH_MAINNET}`]: priced("3200"), ["137:0x0d500b1d8e8ef31e21c99d1db9a6444d3adf1270"]: priced("0.09") },
+    });
+    const result = await service.holdings("u1");
+    expect(result.holdings.map((holding) => [holding.chainId, holding.symbol, holding.valueUsd])).toEqual([[10, "ETH", "3200"], [8453, "ETH", "3200"], [137, "POL", "0.09"]]);
+    expect(lookup).toHaveBeenCalledTimes(2);
+    expect(lookup).toHaveBeenCalledWith(1, WETH_MAINNET);
+    expect(lookup).not.toHaveBeenCalledWith(10, expect.anything());
+  });
+
   it("memoizes per user for the TTL and forgets a failed read immediately", async () => {
     const { service, readBalances, advance } = makeService({
       snapshots: { [WALLET_A]: { chains: [{ chainId: 1, nativeRaw: 1n, tokens: [] }], skippedChainIds: [], truncatedChainIds: [] } },
