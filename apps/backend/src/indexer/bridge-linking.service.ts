@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from "@nestjs/common";
 import type { TransactionRecord } from "../shared/repository.types";
 import type { TransactionRepository } from "./transaction.repository";
 import { TRANSACTION_REPOSITORY } from "./indexer.tokens";
+import { isOwnTransferGroup } from "./own-wallet-linking.service";
 
 // A destination IN arrives shortly after the source OUT; a 6h window is generous for slow bridges
 // while staying far below the "unrelated transfer" horizon.
@@ -44,6 +45,28 @@ const CANONICAL_ERC20: Record<string, string> = {
   "137:0xc2132d05d31c914a87c6611c10748aeb04b58e8f": "USDT",
 };
 
+// Canonical asset keys that are interchangeable USD units. A bridge aggregator routing through a
+// liquidity pool (Mayan, Relay, LI.FI) routinely pays out the OTHER stablecoin on the destination
+// chain, so a same-symbol rule loses the whole move. Membership is checked on the RESOLVED key,
+// which only a known canonical contract can produce - a spoofed "USDC" never reaches this set.
+const USD_STABLE_KEYS = new Set(["token:USDC", "token:USDT"]);
+
+/**
+ * How a matched pair should be booked.
+ *  - `transfer`: same canonical asset on both ends. A pure non-taxable self-move.
+ *  - `swap`: two DIFFERENT canonical USD stablecoins. The bridge sold one and delivered the other,
+ *    which is a disposal, so it is booked as a swap that happens to cross a chain.
+ */
+type LinkKind = "transfer" | "swap";
+
+// Classification each leg gets per kind. The `swap` row keeps the disposal on the OUT leg and makes
+// the IN leg the cost-basis anchor for the asset that arrived.
+const OUT_CLASSIFICATION: Record<LinkKind, string> = { transfer: "INTERNAL_TRANSFER", swap: "EXCHANGE" };
+const IN_CLASSIFICATION: Record<LinkKind, string> = { transfer: "INTERNAL_TRANSFER", swap: "RECEIVE" };
+
+// A confirmed pair is no longer a suspicion, so both legs leave the FE's "needs review" floor (0.5).
+const LINK_CONFIDENCE = 0.9;
+
 /**
  * Cross-chain bridge linking over the user's OWN indexed data.
  *
@@ -61,6 +84,19 @@ const CANONICAL_ERC20: Record<string, string> = {
  *  - RECOGNIZED CANONICAL ASSET only (native, canonical WETH, or a canonical stablecoin). An unknown
  *    or spoofed same-symbol token does not resolve and is left flagged for manual review;
  *  - cross-chain, destination within 6h after the source, received amount inside the fee band.
+ *
+ * Two kinds of pair, because a bridge does not always deliver what it took (see `LinkKind`):
+ *  - SAME canonical asset -> both legs INTERNAL_TRANSFER, the non-taxable move described above;
+ *  - two DIFFERENT canonical USD stablecoins (USDT in, USDC out) -> the aggregator sold one asset and
+ *    delivered another, which IS a disposal. Those legs are booked EXCHANGE (OUT) + RECEIVE (IN) so
+ *    the tax engine still charges the conversion, and they carry the SAME `bridge_group_id` +
+ *    `bridge_dest_chain_id` purely as display/provenance. `bridge_group_id` moves cost between pools
+ *    only together with `classification: "INTERNAL_TRANSFER"` (cost-basis.ts `bridgeGroupOf`), so a
+ *    swap pair links for the FE without ever relocating the cost of a taxable event.
+ *  The swap kind deliberately does NOT set `group_id`. `group_id` means "one transaction" to every
+ *  consumer, and the tax engine collapses a `group_id` to a single gas target (cost-basis.ts
+ *  `planGasAttribution`) - across two chains that would silently drop the source-chain fee the user
+ *  actually paid in favour of the destination leg, whose fee a relayer paid.
  *
  * Deterministic + idempotent + self-healing: `bridge_group_id` is a pure function of the source leg,
  * and this re-derives every link from stable asset data (chain/asset/amount/time) on every run. A
@@ -87,13 +123,19 @@ export class BridgeLinkingService {
 
     // Build the full eligibility graph BEFORE mutating, so uniqueness is bidirectional (not greedy):
     // link only an isolated edge where the OUT has one eligible IN and that IN has one eligible OUT.
-    const eligibleInsByOut = new Map<string, TransactionRecord[]>();
+    // A same-asset and a cross-asset candidate compete in the SAME graph, so an OUT that could be
+    // read either way is ambiguous and stays unlinked.
+    const eligibleInsByOut = new Map<string, { leg: TransactionRecord; kind: LinkKind }[]>();
     const eligibleOutCountByIn = new Map<string, number>();
     for (const out of outs) {
-      const matches = ins.filter((inLeg) => this.pairEligible(out, inLeg));
+      const matches: { leg: TransactionRecord; kind: LinkKind }[] = [];
+      for (const inLeg of ins) {
+        const kind = this.pairKind(out, inLeg);
+        if (kind !== null) matches.push({ leg: inLeg, kind });
+      }
       eligibleInsByOut.set(String(out.payload.id), matches);
-      for (const inLeg of matches) {
-        const key = String(inLeg.payload.id);
+      for (const match of matches) {
+        const key = String(match.leg.payload.id);
         eligibleOutCountByIn.set(key, (eligibleOutCountByIn.get(key) ?? 0) + 1);
       }
     }
@@ -102,14 +144,20 @@ export class BridgeLinkingService {
     for (const out of outs) {
       const matches = eligibleInsByOut.get(String(out.payload.id)) ?? [];
       if (matches.length !== 1) continue; // the OUT must have exactly one eligible IN
-      const inLeg = matches[0];
+      const { leg: inLeg, kind } = matches[0];
       if (eligibleOutCountByIn.get(String(inLeg.payload.id)) !== 1) continue; // ...and that IN exactly one OUT
       const groupId = `bridge:${out.payload.chain_id}:${out.payload.tx_hash}`;
       try {
         // Per-pair isolation: a write failure on one pair leaves the other pairs (and a later repair
         // run of this pair) unaffected. A one-sided failure is healed on the next run.
-        const outChanged = await this.applyLink(userId, out, groupId, Number(inLeg.payload.chain_id));
-        const inChanged = await this.applyLink(userId, inLeg, groupId);
+        const outChanged = await this.applyLink(
+          userId,
+          out,
+          groupId,
+          OUT_CLASSIFICATION[kind],
+          Number(inLeg.payload.chain_id),
+        );
+        const inChanged = await this.applyLink(userId, inLeg, groupId, IN_CLASSIFICATION[kind]);
         if (outChanged || inChanged) changed += 1;
       } catch (error) {
         this.logger.warn(`bridge link write failed for ${groupId}: ${(error as Error).message}`);
@@ -121,22 +169,49 @@ export class BridgeLinkingService {
   private isBridgeOutCandidate(leg: TransactionRecord): boolean {
     const p = leg.payload;
     // No bridge_group_id guard: candidacy is re-derived every run so an orphaned/reverted link heals.
-    return p.bridge_suspected === true && p.direction === "OUT" && p.user_override == null && p.group_id == null;
+    // The one exception is an `own:` key - that leg is a proven same-user wallet-to-wallet move
+    // (own-wallet-linking.service.ts) and its pairing must not be stolen by a bridge guess.
+    return (
+      p.bridge_suspected === true &&
+      p.direction === "OUT" &&
+      p.user_override == null &&
+      p.group_id == null &&
+      !isOwnTransferGroup(p.bridge_group_id)
+    );
   }
 
   private isLinkableIn(leg: TransactionRecord): boolean {
     const p = leg.payload;
-    return p.user_override == null && p.group_id == null; // classification-agnostic (a SPAM dest can be rescued)
+    // classification-agnostic (a SPAM dest can be rescued), but never an own-wallet-linked leg.
+    return p.user_override == null && p.group_id == null && !isOwnTransferGroup(p.bridge_group_id);
   }
 
-  private pairEligible(out: TransactionRecord, inLeg: TransactionRecord): boolean {
+  /** How this OUT/IN edge should be booked, or null when it is not a pair at all. */
+  private pairKind(out: TransactionRecord, inLeg: TransactionRecord): LinkKind | null {
     const p = inLeg.payload;
-    if (String(p.id) === String(out.payload.id)) return false;
-    if (Number(p.chain_id) === Number(out.payload.chain_id)) return false; // a bridge crosses chains
-    if (!this.assetEquivalent(out.payload, p)) return false;
-    if (!this.withinWindow(out.occurredAt, inLeg.occurredAt)) return false;
-    if (!this.amountWithinFeeBand(out.payload, p)) return false;
-    return true;
+    if (String(p.id) === String(out.payload.id)) return null;
+    if (Number(p.chain_id) === Number(out.payload.chain_id)) return null; // a bridge crosses chains
+    const kind = this.linkKind(out.payload, p);
+    if (kind === null) return null;
+    if (!this.withinWindow(out.occurredAt, inLeg.occurredAt)) return null;
+    // One band for both kinds. The observed cross-asset case (17.26924 USDT -> 15.941987 USDC, 92.3%)
+    // already sits inside it, and a stablecoin-to-stablecoin rate is ~1.0 by construction, so the
+    // same-asset band is not loosened to admit it.
+    if (!this.amountWithinFeeBand(out.payload, p)) return null;
+    return kind;
+  }
+
+  /**
+   * Asset relationship between the two legs, resolved through canonical contracts only.
+   * Same canonical key -> a transfer. Two different canonical USD stablecoins -> a bridge that also
+   * swapped. Anything else (unknown token, spoof, ETH-for-USDC) -> null, left for manual review.
+   */
+  private linkKind(out: Record<string, unknown>, inLeg: Record<string, unknown>): LinkKind | null {
+    const keyOut = this.canonicalAssetKey(out);
+    const keyIn = this.canonicalAssetKey(inLeg);
+    if (keyOut === null || keyIn === null) return null;
+    if (keyOut === keyIn) return "transfer";
+    return USD_STABLE_KEYS.has(keyOut) && USD_STABLE_KEYS.has(keyIn) ? "swap" : null;
   }
 
   /**
@@ -159,12 +234,6 @@ export class BridgeLinkingService {
       if (symbol) return `token:${symbol}`;
     }
     return null;
-  }
-
-  private assetEquivalent(a: Record<string, unknown>, b: Record<string, unknown>): boolean {
-    const keyA = this.canonicalAssetKey(a);
-    const keyB = this.canonicalAssetKey(b);
-    return keyA !== null && keyA === keyB;
   }
 
   private withinWindow(outAt: Date, inAt: Date): boolean {
@@ -199,12 +268,14 @@ export class BridgeLinkingService {
     userId: string,
     leg: TransactionRecord,
     groupId: string,
+    classification: string,
     destChainId?: number,
   ): Promise<boolean> {
     const p = leg.payload;
     const alreadyLinked =
-      p.classification === "INTERNAL_TRANSFER" &&
+      p.classification === classification &&
       p.bridge_group_id === groupId &&
+      p.confidence === LINK_CONFIDENCE &&
       (destChainId === undefined || p.bridge_dest_chain_id === destChainId);
     if (alreadyLinked) return false; // no write -> no churn, and repeat runs are true no-ops
 
@@ -212,8 +283,8 @@ export class BridgeLinkingService {
     // untouched (this is a system reclassification, not a user edit, and never re-anchors).
     const payload: Record<string, unknown> = {
       ...p,
-      classification: "INTERNAL_TRANSFER",
-      confidence: 0.9,
+      classification,
+      confidence: LINK_CONFIDENCE,
       bridge_group_id: groupId,
       ...(destChainId !== undefined ? { bridge_dest_chain_id: destChainId } : {}),
     };

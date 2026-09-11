@@ -24,6 +24,7 @@ import { CoinGeckoHistoricalPriceOracle, MockHistoricalPriceOracle } from "./his
 import { MockHistoricalPriceRepository, PrismaHistoricalPriceRepository } from "./historical-price.repository.adapters";
 import { HistoricalPriceEnrichmentService } from "./historical-price-enrichment.service";
 import { BridgeLinkingService } from "./bridge-linking.service";
+import { OwnWalletLinkingService } from "./own-wallet-linking.service";
 import { InMemorySyncJobStore } from "./sync-job";
 import { SyncJobRunner, SyncJobService } from "./sync-job.service";
 import { BullSyncDispatcher, InProcessSyncDispatcher, SyncProcessor } from "./sync.queue";
@@ -69,6 +70,7 @@ const mock = process.env.MOCK_MODE !== "false";
     { provide: HISTORICAL_PRICE_REPOSITORY, useFactory: (config: ConfigService, memory: MockHistoricalPriceRepository, prisma: PrismaHistoricalPriceRepository) => usePrismaPersistence(config) ? prisma : memory, inject: [ConfigService, MockHistoricalPriceRepository, PrismaHistoricalPriceRepository] },
     HistoricalPriceEnrichmentService,
     BridgeLinkingService,
+    OwnWalletLinkingService,
     IndexerService,
     InMemorySyncJobStore,
     { provide: SYNC_JOB_STORE, useExisting: InMemorySyncJobStore },
