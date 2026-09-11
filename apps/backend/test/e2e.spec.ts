@@ -100,6 +100,16 @@ describe("VERA Wallet mock journey", () => {
     // The mock ledger holds native ETH on chain 1, so ETH carries a KRW cost cell; the stables were never indexed.
     expect(holdings.body.data.holdings[0].costBasis).toMatchObject({ currency: "KRW" });
     expect(holdings.body.data.holdings[1].costBasis).toBeNull();
+    expect(holdings.body.data.byWallet).toEqual([{ address: account.address.toLowerCase(), verificationMethod: "siwe", totalValueUsd: "3750", chainIds: [1, 137, 8453], holdingsCount: 3, unpricedCount: 0 }]);
+    // 지갑 목록은 잔액과 분리된 사실이다.
+    const wallets = await browser.get("/api/auth/wallets").expect(200);
+    expect(wallets.body.data.wallets).toHaveLength(1);
+    expect(wallets.body.data.wallets[0]).toMatchObject({ walletAddress: account.address, verificationMethod: "siwe" });
+    // 지갑 하나만: 같은 값, 미등록 주소는 404, 형식 오류는 400.
+    const one = await browser.get(`/api/portfolio/holdings?address=${account.address}`).expect(200);
+    expect(one.body.data.byWallet).toHaveLength(1);
+    await browser.get("/api/portfolio/holdings?address=0x9999999999999999999999999999999999999999").expect(404);
+    await browser.get("/api/portfolio/holdings?address=nope").expect(400);
   });
 
   it("binds a watch-only wallet: 401 unauth, 400 invalid, 201 + checksum, session marks watch_only", async () => {

@@ -631,8 +631,12 @@ type JudgmentExtraDTO = {
 ### 보유 자산 조회
 
 ```
-GET /api/portfolio/holdings
+GET /api/portfolio/holdings              # 등록한 지갑 전부 합산
+GET /api/portfolio/holdings?address=0x…  # 지갑 하나(미등록 주소 404, 형식 오류 400)
+GET /api/auth/wallets                    # 등록한 지갑 목록 { wallets: [{ walletAddress, verificationMethod, boundAt }] }
 ```
+
+지갑 탭은 `GET /api/auth/wallets`로 목록(등록 방식 포함)을 먼저 그리고, `holdings`의 `byWallet`(지갑별 `totalValueUsd`·`chainIds`·`holdingsCount`·`unpricedCount`)로 행마다 평가액과 잔액 있는 체인을 채웁니다. 지갑 상세는 `?address=`로 그 지갑만 읽습니다. 목록과 잔액을 분리한 이유는 잔액 서버가 응답하지 않아도 "무엇을 등록했는가"는 그려져야 하기 때문입니다.
 
 지갑 홈이 그리는 "지금 들고 있는 것"입니다. **현재 온체인 잔액**(노드 조회, 저장하지 않음)에 **원장(인덱싱된 이벤트)의 심볼·소수점·이동평균 원가**와 **DexScreener 현재 시세**를 붙여 돌려줍니다. 이벤트 목록과 같은 최초 동기화 게이트를 지나므로, 바인딩 직후 첫 호출은 최대 3초 기다렸다가 그때까지 쌓인 원장으로 응답합니다.
 
@@ -640,6 +644,7 @@ GET /api/portfolio/holdings
 {
   "data": {
     "walletAddresses": ["0x1111…"],
+    "byWallet": [{ "address": "0x1111…", "verificationMethod": "siwe", "totalValueUsd": "2400", "chainIds": [1], "holdingsCount": 1, "unpricedCount": 0 }],
     "holdings": [
       {
         "chainId": 1, "assetType": "NATIVE", "contract": null,

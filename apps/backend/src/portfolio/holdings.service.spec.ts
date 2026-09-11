@@ -128,6 +128,7 @@ describe("PortfolioHoldingsService.holdings", () => {
     expect(usdc.costBasis).toEqual({ currency: "KRW", totalCost: "700000", avgCost: "1400", trackedAmount: "500" });
     expect(result.totalValueUsd).toBe("2900");
     expect(result.unpricedCount).toBe(0);
+    expect(result.byWallet).toEqual([{ address: WALLET_A, verificationMethod: "siwe", totalValueUsd: "2900", chainIds: [1], holdingsCount: 2, unpricedCount: 0 }]);
     // Native price is read through the chain's wrapped-native contract.
     expect(lookup).toHaveBeenCalledWith(1, WETH_MAINNET);
   });
@@ -186,6 +187,20 @@ describe("PortfolioHoldingsService.holdings", () => {
     const eth = result.holdings.find((holding) => holding.assetType === "NATIVE")!;
     expect(eth.amount).toBe("3");
     expect(eth.priceStatus).toBe("unknown");
+    // 지갑별 요약: 각 지갑의 잔액만, 살아남은 자산만, 시세 없는 것은 0이 아니라 unpriced로.
+    expect(result.byWallet.map((wallet) => [wallet.address, wallet.chainIds, wallet.holdingsCount, wallet.unpricedCount, wallet.totalValueUsd])).toEqual([
+      [WALLET_A, [1], 1, 1, "0"],
+      [WALLET_B, [1, 8453], 1 + MAX_UNKNOWN_TOKENS_PER_CHAIN, 1 + MAX_UNKNOWN_TOKENS_PER_CHAIN, "0"],
+    ]);
+
+    // ?address= 는 그 지갑만 읽는다(다른 지갑의 잔액 조회를 하지 않는다). 미등록 주소는 404.
+    readBalances.mockClear();
+    const only = await service.holdings("u1", WALLET_B.toUpperCase());
+    expect(readBalances).toHaveBeenCalledTimes(1);
+    expect(only.walletAddresses).toEqual([WALLET_B]);
+    expect(only.byWallet).toHaveLength(1);
+    expect(only.holdings.find((holding) => holding.assetType === "NATIVE")!.amount).toBe("2");
+    await expect(service.holdings("u1", "0x9999999999999999999999999999999999999999")).rejects.toBeInstanceOf(NotFoundException);
   });
 
   it("prices every ETH-native chain through mainnet WETH once (Base/Optimism share a WETH address that starves DexScreener's per-chain filter)", async () => {

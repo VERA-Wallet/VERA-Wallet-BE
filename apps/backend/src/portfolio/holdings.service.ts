@@ -61,8 +61,23 @@ export interface HoldingDto {
   costBasis: HoldingCostDto | null;
 }
 
+/** 지갑 하나의 요약. 목록 화면이 행마다 "이 지갑에 얼마가, 어느 체인에" 있는지를 이걸로 말한다. */
+export interface WalletSummaryDto {
+  /** 소문자 주소. */
+  address: string;
+  verificationMethod: string;
+  /** 이 지갑의 시세 있는 보유분 USD 합. */
+  totalValueUsd: string;
+  /** 잔액이 실제로 있는 체인(스팸·더스트 제외 후). */
+  chainIds: number[];
+  holdingsCount: number;
+  unpricedCount: number;
+}
+
 export interface HoldingsDto {
   walletAddresses: string[];
+  /** 지갑별 요약. `?address=`로 하나만 조회하면 그 지갑 하나다. */
+  byWallet: WalletSummaryDto[];
   holdings: HoldingDto[];
   /** Chains that could not be read for at least one wallet; their assets are absent, not zero. */
   skippedChainIds: number[];
@@ -113,28 +128,39 @@ export class PortfolioHoldingsService {
     @Optional() private readonly now: () => Date = () => new Date(),
   ) {}
 
-  async holdings(userId: string): Promise<HoldingsDto> {
+  /** `address`를 주면 그 지갑 하나만(등록돼 있지 않으면 404). 없으면 등록한 지갑 전부를 합산한다. */
+  async holdings(userId: string, address?: string): Promise<HoldingsDto> {
+    const scope = address ? address.toLowerCase() : "*";
+    const memoKey = `${userId}:${scope}`;
     const at = this.now().getTime();
-    const hit = this.memo.get(userId);
+    const hit = this.memo.get(memoKey);
     if (hit && hit.expiresAt > at) return hit.pending;
     // Sweep expired entries on write so the table is bounded by concurrently-active users, not by every
     // user id the process has ever served.
     for (const [key, entry] of this.memo) if (entry.expiresAt <= at) this.memo.delete(key);
     const entry = { expiresAt: at + HOLDINGS_TTL_MS, pending: undefined as unknown as Promise<HoldingsDto> };
-    entry.pending = this.load(userId).catch((error: unknown) => {
+    entry.pending = this.load(userId, scope === "*" ? undefined : scope).catch((error: unknown) => {
       // A failed read must not pin its rejection for the TTL: the next caller retries the providers.
       // Identity-checked so a late rejection cannot evict a newer, healthy entry for the same user.
-      if (this.memo.get(userId) === entry) this.memo.delete(userId);
+      if (this.memo.get(memoKey) === entry) this.memo.delete(memoKey);
       throw error;
     });
-    this.memo.set(userId, entry);
+    this.memo.set(memoKey, entry);
     return entry.pending;
   }
 
-  private async load(userId: string): Promise<HoldingsDto> {
-    const bindings = await this.wallets.findAllByUser(userId);
-    if (bindings.length === 0) throw new NotFoundException("A bound wallet is required before reading holdings.");
+  private async load(userId: string, onlyAddress?: string): Promise<HoldingsDto> {
+    const all = await this.wallets.findAllByUser(userId);
+    if (all.length === 0) throw new NotFoundException("A bound wallet is required before reading holdings.");
+    const bindings = onlyAddress === undefined ? all : all.filter((binding) => binding.walletAddress.toLowerCase() === onlyAddress);
+    if (bindings.length === 0) throw new NotFoundException("That wallet is not registered to this user.");
     const addresses = [...new Set(bindings.map((binding) => binding.walletAddress.toLowerCase()))];
+    // 같은 주소를 두 방식(siwe·watch_only)으로 등록했으면 더 강한 검증을 말한다.
+    const verificationOf = new Map<string, string>();
+    for (const binding of bindings) {
+      const current = verificationOf.get(binding.walletAddress.toLowerCase());
+      if (current === undefined || (current === "watch_only" && binding.verificationMethod !== "watch_only")) verificationOf.set(binding.walletAddress.toLowerCase(), binding.verificationMethod);
+    }
 
     // Ledger first: it gates the initial sync exactly like the events read (so a fresh binding is
     // indexed once, here or there, never twice) and provides symbol/decimals + cost for known assets.
@@ -155,6 +181,7 @@ export class PortfolioHoldingsService {
     const holdings = priced
       .map((asset) => toHoldingDto(asset, cost.get(holdingAssetKey(asset.chainId, asset.assetType, asset.contract))))
       .sort(compareHoldings);
+    const byWallet = addresses.map((address, index) => walletSummary(address, verificationOf.get(address) ?? "watch_only", snapshots[index], priced));
 
     let totalValueUsd = new Decimal(0);
     let unpricedCount = 0;
@@ -164,6 +191,7 @@ export class PortfolioHoldingsService {
     }
     return {
       walletAddresses: addresses,
+      byWallet,
       holdings,
       skippedChainIds,
       truncatedChainIds: [...truncated].sort((a, b) => a - b),
@@ -299,6 +327,32 @@ function nativePriceSourceOf(chainId: number): { chainId: number; contract: stri
   if (!own) return null;
   const home = CHAIN_REGISTRY.find((entry) => entry.nativeSymbol === own.nativeSymbol) ?? own;
   return home.wrappedNativeContract ? { chainId: home.chainId, contract: home.wrappedNativeContract } : null;
+}
+
+/**
+ * 지갑 하나의 요약. 합산 결과(`priced`)에 살아남은 자산만 센다 — 스팸·더스트로 걸러진 잔액은 지갑별 합에도 들어가지 않는다.
+ * 시세가 없는 자산은 0이 아니라 빠지고 `unpricedCount`에 센다.
+ */
+export function walletSummary(address: string, verificationMethod: string, snapshot: BalanceSnapshot, priced: readonly PricedAsset[]): WalletSummaryDto {
+  const byKey = new Map(priced.map((asset) => [holdingAssetKey(asset.chainId, asset.assetType, asset.contract), asset] as const));
+  const { candidates } = mergeSnapshots([snapshot]);
+  let total = new Decimal(0);
+  let holdingsCount = 0;
+  let unpricedCount = 0;
+  const chains = new Set<number>();
+  for (const candidate of candidates) {
+    const asset = byKey.get(holdingAssetKey(candidate.chainId, candidate.assetType, candidate.contract));
+    if (!asset) continue;
+    holdingsCount += 1;
+    chains.add(candidate.chainId);
+    const price = parseDecimalOrNull(asset.market?.priceUsd ?? null);
+    if (price === null) {
+      unpricedCount += 1;
+      continue;
+    }
+    total = total.plus(new Decimal(formatUnits(candidate.rawAmount, asset.decimals)).mul(price));
+  }
+  return { address, verificationMethod, totalValueUsd: total.toDecimalPlaces(8).toFixed(), chainIds: [...chains].sort((a, b) => a - b), holdingsCount, unpricedCount };
 }
 
 /** Sum the same asset across every bound wallet; union the skipped and truncated chains. */
