@@ -2,6 +2,7 @@ import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { AnchorModule } from "../anchor/anchor.module";
 import { AuthModule } from "../auth/auth.module";
+import { IdentityModule } from "../identity/identity.module";
 import { SharedModule } from "../shared/shared.module";
 import { usePrismaPersistence } from "../shared/persistence-mode";
 import { FrontendSessionController } from "./frontend-session.controller";
@@ -13,7 +14,7 @@ import { MockWalletRepository, PrismaWalletRepository } from "./wallet.repositor
 import { WALLET_BINDING_REPOSITORY, WALLET_REPOSITORY } from "./wallet.tokens";
 
 @Module({
-  imports: [AuthModule, SharedModule, AnchorModule],
+  imports: [AuthModule, SharedModule, AnchorModule, IdentityModule],
   controllers: [WalletController, FrontendWalletController, FrontendSessionController],
   providers: [
     WalletService,

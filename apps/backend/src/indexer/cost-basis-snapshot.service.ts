@@ -1,5 +1,5 @@
 import { Inject, Injectable, Logger, Optional } from "@nestjs/common";
-import { computeCostBasis, type CostBasisOptions, type CostBasisResult } from "@vera/tax-engine";
+import { computeCostBasis, computeHoldingsCostBasis, type CostBasisOptions, type CostBasisResult, type HoldingCostBasis } from "@vera/tax-engine";
 import type { TransactionRecord } from "../shared/repository.types";
 import { HISTORICAL_PRICE_REPOSITORY } from "./indexer.tokens";
 import type { CostBasisSnapshotPort } from "./cost-basis-snapshot.port";
@@ -20,6 +20,7 @@ const NO_GAS: object = Object.freeze({});
 const NO_PRICES: ReadonlyMap<string, string> = Object.freeze(new Map<string, string>());
 
 export type CostBasisFold = (events: TransactionRecord[], options?: CostBasisOptions) => Map<string, CostBasisResult>;
+export type HoldingsFold = (events: TransactionRecord[], options?: CostBasisOptions) => Map<string, HoldingCostBasis>;
 
 /**
  * The one place a user's cost-basis fold is computed, shared by every read path.
@@ -41,12 +42,14 @@ export type CostBasisFold = (events: TransactionRecord[], options?: CostBasisOpt
 export class CostBasisSnapshotService implements CostBasisSnapshotPort {
   private readonly logger = new Logger(CostBasisSnapshotService.name);
   private readonly folds = new WeakMap<TransactionRecord[], WeakMap<object, Promise<Map<string, CostBasisResult>>>>();
+  private readonly holdingsFolds = new WeakMap<TransactionRecord[], WeakMap<object, Promise<Map<string, HoldingCostBasis>>>>();
   private readonly nativePrices = new WeakMap<TransactionRecord[], Promise<ReadonlyMap<string, string>>>();
 
   constructor(
     @Inject(HISTORICAL_PRICE_REPOSITORY) private readonly prices: HistoricalPriceRepository,
     // Injected so a spec can count folds; Nest leaves it undefined and the default wins.
     @Optional() private readonly fold: CostBasisFold = computeCostBasis,
+    @Optional() private readonly holdingsFold: HoldingsFold = computeHoldingsCostBasis,
   ) {}
 
   /**
@@ -78,6 +81,36 @@ export class CostBasisSnapshotService implements CostBasisSnapshotPort {
         // A rejected fold must never stay in the memo: every later read of this snapshot
         // would replay the same exception until the ledger cache expired. Drop the entry
         // and let the caller see the real error, so the next read retries from scratch.
+        memo.delete(cacheKey);
+        throw error;
+      });
+    memo.set(cacheKey, pending);
+    return pending;
+  }
+
+  /**
+   * Remaining holdings + average cost per asset after the full-ledger fold. Same two-level
+   * identity memo as `snapshotFor` (rows instance, then the native-price map), kept in its own
+   * table because the value type differs; the price map memo is shared, so a request that reads
+   * both events and holdings probes the historical-price cache once.
+   */
+  async holdingsFor(userId: string, rows: TransactionRecord[], opts?: { gas?: boolean }): Promise<Map<string, HoldingCostBasis>> {
+    const withGas = opts?.gas !== false;
+    const nativePrices = withGas ? await this.nativePricesFor(userId, rows) : undefined;
+    const cacheKey = nativePrices ?? NO_GAS;
+
+    let byPrices = this.holdingsFolds.get(rows);
+    if (byPrices === undefined) {
+      byPrices = new WeakMap();
+      this.holdingsFolds.set(rows, byPrices);
+    }
+    const memo = byPrices;
+    const inflight = memo.get(cacheKey);
+    if (inflight !== undefined) return inflight;
+
+    const pending = Promise.resolve()
+      .then(() => this.holdingsFold(rows, nativePrices === undefined ? undefined : { nativePrices }))
+      .catch((error: unknown) => {
         memo.delete(cacheKey);
         throw error;
       });

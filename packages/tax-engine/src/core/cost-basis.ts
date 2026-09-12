@@ -352,10 +352,63 @@ function gasFiatOf(
  * Returns a Map keyed by event id. Excluded events (spam/unknown/internal-transfer
  * or missing price) are still present with excluded:true and an excludeReason.
  */
+/**
+ * What the fold knows about one asset cell after the last event: quantity still held and the
+ * moving-average unit cost. `assetKey` is `holdingAssetKey(...)`, the same key the per-event fold
+ * uses, so a live balance row can be joined onto its ledger cost without re-deriving the key.
+ * Monetary strings are in the ledger's fiat unit (the events' `fiat_currency`).
+ */
+export type HoldingCostBasis = {
+  assetKey: string;
+  qty: string;
+  avgCost: string;
+  totalCost: string;
+};
+
+/**
+ * The asset cell identity the fold accumulates under. Exported so a caller holding a live
+ * balance (chain, contract) can look up the matching ledger cell. Contract addresses are
+ * lowercased; native coins use the literal `native` in the contract slot.
+ */
+export function holdingAssetKey(chainId: number | string, assetType: string, contract: string | null, tokenId: string | null = null): string {
+  return assetKeyOf({ chain_id: chainId, asset_type: assetType, asset_contract: contract, token_id: tokenId ?? "" });
+}
+
 export function computeCostBasis(
   events: TaxableTransaction[],
   options?: CostBasisOptions,
 ): Map<string, CostBasisResult> {
+  return foldCostBasis(events, options).results;
+}
+
+/**
+ * Remaining holdings after folding the FULL ledger: one cell per asset that still has a
+ * positive tracked quantity. Same ordering, bridge escrow, and gas rules as `computeCostBasis`;
+ * this is the fold's terminal state, not a second algorithm. Callers must pass the whole
+ * history for the same reason as the per-event fold — a period filter drops prior acquisitions.
+ */
+export function computeHoldingsCostBasis(
+  events: TaxableTransaction[],
+  options?: CostBasisOptions,
+): Map<string, HoldingCostBasis> {
+  const { state } = foldCostBasis(events, options);
+  const holdings = new Map<string, HoldingCostBasis>();
+  for (const [assetKey, cell] of state) {
+    if (!cell.qty.greaterThan(0)) continue;
+    holdings.set(assetKey, {
+      assetKey,
+      qty: cell.qty.toFixed(),
+      avgCost: cell.avgCost.toFixed(),
+      totalCost: cell.qty.mul(cell.avgCost).toFixed(),
+    });
+  }
+  return holdings;
+}
+
+function foldCostBasis(
+  events: TaxableTransaction[],
+  options?: CostBasisOptions,
+): { results: Map<string, CostBasisResult>; state: Map<string, AssetState> } {
   // Chronological fold. Same-timestamp events (e.g. both legs of a swap in one block)
   // break ties by on-chain log_index first, then event id, so ordering follows block
   // execution order rather than an arbitrary id sort.
@@ -508,5 +561,5 @@ export function computeCostBasis(
     results.set(outId, { ...result, review: pickReview(result.review, "bridge_move_unmatched")! });
   }
 
-  return results;
+  return { results, state };
 }

@@ -626,6 +626,63 @@ type JudgmentExtraDTO = {
 
 현재 제한: Backend v1 호환 계층에서는 `source: "scenario"`와 `source: "wallet"`이 모두 동기화된 지갑 이벤트를 사용합니다. `profile`과 `includeMarginal`도 요청 검증은 하지만 아직 계산에 반영하지 않습니다. FE 내부의 별도 국가 비교 scenario fixture 및 한계기여도와 완전히 같은 결과가 필요한 경우 후속 API 계약 확장이 필요합니다.
 
+## 7-1. 포트폴리오 API (보유 자산)
+
+### 보유 자산 조회
+
+```
+GET /api/portfolio/holdings              # 등록한 지갑 전부 합산
+GET /api/portfolio/holdings?address=0x…  # 지갑 하나(미등록 주소 404, 형식 오류 400)
+GET /api/auth/wallets                    # 등록한 지갑 목록 { wallets: [{ walletAddress, verificationMethod, boundAt }] }
+```
+
+지갑 탭은 `GET /api/auth/wallets`로 목록(등록 방식 포함)을 먼저 그리고, `holdings`의 `byWallet`(지갑별 `totalValueUsd`·`chainIds`·`holdingsCount`·`unpricedCount`)로 행마다 평가액과 잔액 있는 체인을 채웁니다. 지갑 상세는 `?address=`로 그 지갑만 읽습니다. 목록과 잔액을 분리한 이유는 잔액 서버가 응답하지 않아도 "무엇을 등록했는가"는 그려져야 하기 때문입니다.
+
+지갑 홈이 그리는 "지금 들고 있는 것"입니다. **현재 온체인 잔액**(노드 조회, 저장하지 않음)에 **원장(인덱싱된 이벤트)의 심볼·소수점·이동평균 원가**와 **DexScreener 현재 시세**를 붙여 돌려줍니다. 이벤트 목록과 같은 최초 동기화 게이트를 지나므로, 바인딩 직후 첫 호출은 최대 3초 기다렸다가 그때까지 쌓인 원장으로 응답합니다.
+
+```json
+{
+  "data": {
+    "walletAddresses": ["0x1111…"],
+    "byWallet": [{ "address": "0x1111…", "verificationMethod": "siwe", "totalValueUsd": "2400", "chainIds": [1], "holdingsCount": 1, "unpricedCount": 0 }],
+    "holdings": [
+      {
+        "chainId": 1, "assetType": "NATIVE", "contract": null,
+        "symbol": "ETH", "name": "ETH", "decimals": 18,
+        "rawAmount": "750000000000000000", "amount": "0.75",
+        "priceUsd": "3200.00", "valueUsd": "2400", "priceStatus": "priced",
+        "costBasis": { "currency": "KRW", "totalCost": "3000000", "avgCost": "4000000", "trackedAmount": "0.75" }
+      }
+    ],
+    "skippedChainIds": [],
+    "truncatedChainIds": [],
+    "unresolvedCount": 0,
+    "totalValueUsd": "2400",
+    "unpricedCount": 0,
+    "asOf": "2026-09-11T05:00:00.000Z"
+  },
+  "meta": { "provenance": "mock", "generatedAt": "…" }
+}
+```
+
+필드 해석:
+
+- `amount`는 `rawAmount / 10^decimals`를 정확히 십진 문자열로 편 값입니다(반올림 없음). 표시 반올림은 FE 몫입니다.
+- **통화가 둘입니다.** 시세·평가액은 USD(`priceUsd`, `valueUsd`, `totalValueUsd`), 취득원가는 원장 통화인 KRW(`costBasis.currency`)입니다. BE는 환율을 갖지 않으므로 평가손익을 한 통화로 보여주려면 FE의 환율 소스(`VERAWALLET_FX_SOURCE`)로 한쪽을 환산해야 합니다.
+- `priceStatus`: `priced`(시세 있음) / `illiquid`(DEX 페어는 있으나 가격 없음) / `no_market`(페어 없음, 스테이블·네이티브·허용목록 외에는 더스트로 숨김) / `unknown`(조회 실패 — 값이 없을 뿐 0이 아님). `priceUsd`가 `null`이면 `valueUsd`도 `null`이고 `unpricedCount`에 셉니다.
+- `canonicalAssetId`: 표시용 정식 자산 키(`eth`·`usdc`·`usdt`·`dai`·`pol`·`ath`·`carv`…). 다른 체인의 같은 발행처 토큰이 같은 키를 가지므로 화면이 행을 합칠 수 있습니다. 표에 없는 토큰은 `null`이라 합치지 마십시오. 심볼로 묶지 않습니다(사칭·브릿지 변종 방지). 원장·세금 계산은 체인별 그대로입니다.
+- `costBasis`가 `null`이면 원장이 그 자산을 모릅니다(불러오기 진행 중이거나 이벤트가 없음). `trackedAmount`와 `amount`가 다르면 원장이 잔액을 다 설명하지 못하는 것이니 "원가 계산 중/불완전" 상태로 다루십시오.
+- `skippedChainIds`: 이번 호출에서 읽지 못한 체인. 그 체인 자산은 **없는 게 아니라 모르는 것**입니다. `truncatedChainIds`: 토큰 목록이 페이지 상한(2,000개)을 넘었거나 원장에 없는 미확인 토큰이 체인당 40개를 넘어 나머지를 생략한 체인. `unresolvedCount`: 공급자 메타데이터 조회가 **실패**해서 빠진 ERC20 수(0보다 크면 목록이 불완전하니 "일부 자산 조회 실패"로 표시).
+- `symbol`·`decimals`는 공급자 메타데이터(`alchemy_getTokenMetadata`)가 우선이고 원장은 조회 실패 시 대체입니다. 원장의 decimals는 인덱서가 18로 추측했을 수 있기 때문입니다.
+- 여러 지갑이 바인딩돼 있으면 같은 자산은 합산되고 `walletAddresses`에 전부 실립니다. NFT·디파이 포지션은 이 응답에 없습니다(별도 작업).
+- 응답은 사용자별 30초 메모됩니다. 오류는 메모되지 않습니다.
+
+상태 코드: `401` 세션 없음, `404` 바인딩된 지갑 없음, `503` 모든 체인 조회 실패(Real 모드에서 `ALCHEMY_API_KEY` 미설정 포함).
+
+프록시: 이 경로는 **프록시하지 않습니다.** FE Route Handler(`app/api/portfolio/holdings/route.ts`)가 ON 모드에서도 소유하며, 서버에서 BE를 호출한 뒤 `costBasis`(KRW)를 FE 환율 소스로 USD 환산해 클라이언트에는 원가까지 USD로 통일된 계약을 내려줍니다(`/api/tax/*`와 같은 배치). 기존 `/api/events/*` 와일드카드에 포함되지 않으므로 backend-owned 목록에 넣지 마십시오.
+
+Mock 모드는 데모 지갑(ETH 0.75 on Ethereum, USDC 500 on Base, USDT 850 on Polygon)과 그에 맞는 고정 시세를 돌려줍니다.
+
 ## 8. Backend 핵심 API
 
 현재 FE 호환 계층 외에 다음 핵심 API도 존재합니다. 이 경로는 일부 응답이 `/api/*` envelope 형식이 아니며 Bearer JWT 사용을 지원합니다.
