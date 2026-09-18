@@ -75,6 +75,98 @@ export function summarizeMarket(pairs: unknown, chainSlug: string): TokenMarket 
   return { priceUsd, liquidityUsd, pairCount: onChain.length };
 }
 
+// Supported chain id -> CoinGecko asset platform id (same table as historical-price-oracle.ts).
+const COINGECKO_PLATFORM: Record<number, string> = {
+  1: "ethereum",
+  8453: "base",
+  42161: "arbitrum-one",
+  10: "optimistic-ethereum",
+  137: "polygon-pos",
+};
+
+const COINGECKO_TIMEOUT_MS = 8_000;
+
+// Secondary spot oracle backed by CoinGecko `simple/token_price` (Demo key). Only asked when
+// DexScreener could not answer, so its ~30 req/min budget is spent on failures, not on every asset.
+//
+// It can only ever say "priced" or UNKNOWN: CoinGecko not listing a contract says nothing about
+// whether a DEX market exists, so an unlisted token is `null`, never a confirmed no-market.
+// `pairCount` is 1 (a market is known to exist) and `liquidityUsd` is 0 (not reported by this source).
+@Injectable()
+export class CoinGeckoSpotPriceOracle implements PriceOracle {
+  private readonly logger = new Logger(CoinGeckoSpotPriceOracle.name);
+
+  // No key -> skipped entirely, same policy as the historical oracle (the keyless tier is 401/429).
+  constructor(private readonly apiKey: string | null = null) {}
+
+  async lookup(chainId: number, contract: string): Promise<TokenMarket | null> {
+    if (!this.apiKey) return null;
+    const platform = COINGECKO_PLATFORM[chainId];
+    if (!platform) return null;
+    const address = contract.toLowerCase();
+    try {
+      const response = await fetch(`https://api.coingecko.com/api/v3/simple/token_price/${platform}?contract_addresses=${address}&vs_currencies=usd&precision=full`, {
+        headers: { accept: "application/json", "x-cg-demo-api-key": this.apiKey },
+        signal: AbortSignal.timeout(COINGECKO_TIMEOUT_MS),
+      });
+      if (!response.ok) return null;
+      const body = (await response.json()) as Record<string, { usd?: unknown } | undefined>;
+      const usd = body[address]?.usd;
+      if (typeof usd !== "number" || !Number.isFinite(usd) || usd <= 0) return null;
+      return { priceUsd: String(usd), liquidityUsd: 0, pairCount: 1 };
+    } catch (error) {
+      this.logger.warn(`CoinGecko spot lookup failed for ${chainId}:${contract}: ${(error as Error).message}`);
+      return null;
+    }
+  }
+}
+
+// Canonical USD stablecoin deployments, keyed `${chainId}:${lowercasedContract}`. Contract-keyed on
+// purpose: a symbol is forgeable, so a token merely CALLED "USDT" never gets the $1 peg.
+const USD_STABLE_CONTRACTS: ReadonlySet<string> = new Set([
+  "1:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48", // USDC ethereum
+  "10:0x0b2c639c533813f4aa9d7837caf62653d097ff85", // USDC optimism
+  "137:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359", // USDC polygon
+  "8453:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913", // USDC base
+  "42161:0xaf88d065e77c8cc2239327c5edb3a432268e5831", // USDC arbitrum
+  "1:0xdac17f958d2ee523a2206206994597c13d831ec7", // USDT ethereum
+  "10:0x94b008aa00579c1307b0ef2c499ad98a8ce58e58", // USDT optimism
+  "137:0xc2132d05d31c914a87c6611c10748aeb04b58e8f", // USDT polygon
+  "8453:0xfde4c96c8593536e31f229ea8f37b2ada2699bb2", // USDT base
+  "42161:0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9", // USDT arbitrum
+  "1:0x6b175474e89094c44da98b954eedeac495271d0f", // DAI ethereum
+]);
+
+export function isUsdStable(chainId: number, contract: string): boolean {
+  return USD_STABLE_CONTRACTS.has(`${chainId}:${contract.toLowerCase()}`);
+}
+
+// The live PRICE_ORACLE: DexScreener -> CoinGecko -> $1 peg for canonical stables.
+//
+// A fallback is taken ONLY when the previous source returned `null` (429 / timeout / parse failure).
+// A confirmed DexScreener answer — including a confirmed no-market — is final, so the dust gate in
+// price-enrichment.service.ts keeps its meaning. The peg is display-only like every spot price here;
+// the tax basis comes from the historical oracle and is untouched.
+@Injectable()
+export class FallbackPriceOracle implements PriceOracle {
+  private readonly logger = new Logger(FallbackPriceOracle.name);
+
+  constructor(
+    private readonly primary: PriceOracle,
+    private readonly secondary: PriceOracle,
+  ) {}
+
+  async lookup(chainId: number, contract: string): Promise<TokenMarket | null> {
+    const first = await this.primary.lookup(chainId, contract);
+    if (first !== null) return first;
+    const second = await this.secondary.lookup(chainId, contract);
+    if (second !== null) return second;
+    if (!isUsdStable(chainId, contract)) return null;
+    this.logger.warn(`Both spot sources failed for stablecoin ${chainId}:${contract}; using the 1.00 USD peg.`);
+    return { priceUsd: "1.00", liquidityUsd: 0, pairCount: 1 };
+  }
+}
+
 // Test/offline oracle: every lookup is UNKNOWN, so the mock sync path never mutates
 // classification and never touches the network.
 @Injectable()
