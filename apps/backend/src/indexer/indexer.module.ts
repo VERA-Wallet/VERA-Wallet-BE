@@ -18,7 +18,7 @@ import { TransactionService } from "./transaction.service";
 import { TransactionAvailabilityService } from "./transaction-availability.service";
 import { CachedTransactionRepository, MockTransactionRepository, PrismaTransactionRepository } from "./transaction.repository.adapters";
 import { MockSyncCursorRepository, PrismaSyncCursorRepository } from "./sync-cursor.repository.adapters";
-import { DexScreenerPriceOracle, MockPriceOracle } from "./price-oracle";
+import { CoinGeckoSpotPriceOracle, DexScreenerPriceOracle, FallbackPriceOracle, MockPriceOracle } from "./price-oracle";
 import { PriceEnrichmentService } from "./price-enrichment.service";
 import { CoinGeckoHistoricalPriceOracle, MockHistoricalPriceOracle } from "./historical-price-oracle";
 import { MockHistoricalPriceRepository, PrismaHistoricalPriceRepository } from "./historical-price.repository.adapters";
@@ -50,7 +50,13 @@ const mock = process.env.MOCK_MODE !== "false";
     { provide: SYNC_CURSOR_REPOSITORY, useFactory: (config: ConfigService, memory: MockSyncCursorRepository, prisma: PrismaSyncCursorRepository) => usePrismaPersistence(config) ? prisma : memory, inject: [ConfigService, MockSyncCursorRepository, PrismaSyncCursorRepository] },
     MockPriceOracle,
     DexScreenerPriceOracle,
-    { provide: PRICE_ORACLE, useFactory: (config: ConfigService, mock: MockPriceOracle, real: DexScreenerPriceOracle) => config.get("MOCK_MODE", "true") === "true" ? mock : real, inject: [ConfigService, MockPriceOracle, DexScreenerPriceOracle] },
+    // 실모드 시세: DexScreener가 답하지 못하면(429·타임아웃) CoinGecko로, 그것도 안 되면 정식 스테이블만 1달러로 둔다.
+    {
+      provide: PRICE_ORACLE,
+      useFactory: (config: ConfigService, mock: MockPriceOracle, real: DexScreenerPriceOracle) =>
+        config.get("MOCK_MODE", "true") === "true" ? mock : new FallbackPriceOracle(real, new CoinGeckoSpotPriceOracle(config.get<string>("COINGECKO_API_KEY") || null)),
+      inject: [ConfigService, MockPriceOracle, DexScreenerPriceOracle],
+    },
     PriceEnrichmentService,
     MockHistoricalPriceOracle,
     {
