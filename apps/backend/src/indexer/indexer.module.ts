@@ -83,6 +83,8 @@ const mock = process.env.MOCK_MODE !== "false";
     EventReclassificationService,
     AnchorProofService,
   ],
-  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY],
+  // PRICE_ORACLE을 내보내는 이유: 지갑 홈 보유자산이 같은 mock/live 판정을 쓰게 하려는 것이다.
+  // HoldingsModule이 자기 팩토리를 따로 두면 MOCK_MODE 전환이 두 곳에서 갈릴 수 있다.
+  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY, PRICE_ORACLE],
 })
 export class IndexerModule {}

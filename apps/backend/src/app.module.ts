@@ -7,6 +7,7 @@ import { IndexerModule } from "./indexer/indexer.module";
 import { ReportModule } from "./report/report.module";
 import { TaxModule } from "./tax/tax.module";
 import { WalletModule } from "./wallet/wallet.module";
+import { HoldingsModule } from "./wallet/holdings.module";
 import { AppController } from "./app.controller";
 import { AnchorModule } from "./anchor/anchor.module";
 
@@ -21,7 +22,7 @@ const queueImports = process.env.MOCK_MODE === "false"
   : [];
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, TaxModule, ReportModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, HoldingsModule, TaxModule, ReportModule],
   controllers: [AppController],
 })
 export class AppModule {}
