@@ -2,6 +2,7 @@ import { ServiceUnavailableException } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ChainIndexer, ChainScanResult, IndexedTransaction } from "@vera/interfaces";
 import { IndexerService } from "./indexer.service";
+import { NORMALIZATION_RULES_VERSION } from "./normalization-rules";
 import { MockTransactionRepository } from "./transaction.repository.adapters";
 import { MockSyncCursorRepository } from "./sync-cursor.repository.adapters";
 import { MockWalletRepository } from "../wallet/wallet.repository.adapters";
@@ -363,5 +364,33 @@ describe("IndexerService gaps (AC7/12/14/15)", () => {
     await new Promise((r) => setTimeout(r, 2));
     await h.service.sync("u1"); // forced ALL over an already-synced binding
     expect((await h.wallets.findAllByUser("u1"))[0].initialSyncedAt).toEqual(first);
+  });
+});
+
+describe("IndexerService normalization rules version", () => {
+  it("re-walks a chain whose cursor was written under older rules, then stamps the current version and goes incremental again", async () => {
+    const h = await harness();
+    const binding = await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    // 규칙이 바뀌기 전에 걸어 둔 커서: 1번 체인만 옛 버전이다.
+    for (const chainId of [8453, 42161, 10, 137]) await h.cursors.advance(binding.id, chainId, 80n, NORMALIZATION_RULES_VERSION);
+    await h.cursors.advance(binding.id, 1, 40n, NORMALIZATION_RULES_VERSION - 1);
+
+    await h.service.sync("u1");
+    // 옛 규칙의 체인은 since에서 빠져 처음부터 걷고, 나머지는 평소처럼 증분이다.
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({ 8453: 80n, 42161: 80n, 10: 80n, 137: 80n });
+    expect((await h.cursors.listForBinding(binding.id)).find((c) => c.chainId === 1)).toEqual({ chainId: 1, lastSyncedBlock: 100n, rulesVersion: NORMALIZATION_RULES_VERSION });
+
+    // 한 번 다시 걸었으면 끝이다 — 다음 동기화는 다섯 체인 모두 증분이다.
+    h.indexerFn.mockClear();
+    await h.service.sync("u1");
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({ 1: 100n, 8453: 100n, 42161: 100n, 10: 100n, 137: 100n });
+  });
+
+  it("a never-synced binding still starts from genesis on every chain (no cursors at all)", async () => {
+    const h = await harness();
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    await h.service.sync("u1");
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({});
+    expect((await h.cursors.listForBinding((await h.wallets.findAllByUser("u1"))[0].id)).every((c) => c.rulesVersion === NORMALIZATION_RULES_VERSION)).toBe(true);
   });
 });

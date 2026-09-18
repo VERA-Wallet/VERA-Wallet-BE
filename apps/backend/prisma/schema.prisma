@@ -58,6 +58,9 @@ model BindingChainCursor {
   chainId         Int
   lastSyncedBlock BigInt
   lastSyncedAt    DateTime      @default(now())
+  // 이 체인을 마지막으로 걸었을 때의 정규화 규칙 버전(normalization-rules.ts). 상수보다 낮으면 다음 동기화가 처음부터 다시 걷는다.
+  // 0 = 컬럼이 생기기 전에 걸어 둔 커서("어느 규칙인지 모름").
+  rulesVersion    Int           @default(0)
 
   @@unique([bindingId, chainId])
   @@index([bindingId])
