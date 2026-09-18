@@ -14,11 +14,17 @@ export class MockSyncCursorRepository implements SyncCursorRepository {
       .map(([, cursor]) => ({ ...cursor }));
   }
 
-  async advance(bindingId: string, chainId: number, head: bigint): Promise<void> {
+  async advance(bindingId: string, chainId: number, head: bigint, rulesVersion: number): Promise<void> {
     const key = this.key(bindingId, chainId);
     const existing = this.cursors.get(key);
-    // Monotonic: never lower an already-recorded head.
-    if (!existing || head > existing.lastSyncedBlock) this.cursors.set(key, { chainId, lastSyncedBlock: head });
+    if (!existing) {
+      this.cursors.set(key, { chainId, lastSyncedBlock: head, rulesVersion });
+      return;
+    }
+    // Monotonic on both fields (mirrors the Prisma adapter's GREATEST): never lower a recorded head, never
+    // roll a chain back to older rules.
+    existing.lastSyncedBlock = head > existing.lastSyncedBlock ? head : existing.lastSyncedBlock;
+    existing.rulesVersion = Math.max(existing.rulesVersion, rulesVersion);
   }
 }
 
@@ -28,17 +34,19 @@ export class PrismaSyncCursorRepository implements SyncCursorRepository {
 
   async listForBinding(bindingId: string): Promise<ChainCursor[]> {
     const rows = await this.prisma.bindingChainCursor.findMany({ where: { bindingId } });
-    return rows.map((row) => ({ chainId: row.chainId, lastSyncedBlock: row.lastSyncedBlock }));
+    return rows.map((row) => ({ chainId: row.chainId, lastSyncedBlock: row.lastSyncedBlock, rulesVersion: row.rulesVersion }));
   }
 
-  async advance(bindingId: string, chainId: number, head: bigint): Promise<void> {
-    // Atomic monotonic upsert: GREATEST guarantees the stored block never regresses under out-of-order writes.
+  async advance(bindingId: string, chainId: number, head: bigint, rulesVersion: number): Promise<void> {
+    // Atomic monotonic upsert: GREATEST guarantees neither the stored block nor the rules version regresses
+    // under out-of-order writes.
     await this.prisma.$executeRaw`
-      INSERT INTO "BindingChainCursor" ("id", "bindingId", "chainId", "lastSyncedBlock", "lastSyncedAt")
-      VALUES (${randomUUID()}, ${bindingId}, ${chainId}, ${head}, ${new Date()})
+      INSERT INTO "BindingChainCursor" ("id", "bindingId", "chainId", "lastSyncedBlock", "lastSyncedAt", "rulesVersion")
+      VALUES (${randomUUID()}, ${bindingId}, ${chainId}, ${head}, ${new Date()}, ${rulesVersion})
       ON CONFLICT ("bindingId", "chainId")
       DO UPDATE SET
         "lastSyncedBlock" = GREATEST("BindingChainCursor"."lastSyncedBlock", EXCLUDED."lastSyncedBlock"),
+        "rulesVersion" = GREATEST("BindingChainCursor"."rulesVersion", EXCLUDED."rulesVersion"),
         "lastSyncedAt" = EXCLUDED."lastSyncedAt"
     `;
   }

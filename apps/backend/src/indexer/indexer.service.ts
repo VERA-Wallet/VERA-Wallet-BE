@@ -1,4 +1,4 @@
-import { Inject, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import { Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import type { ChainIndexer } from "@vera/interfaces";
 import { keccak256, toBytes } from "viem";
 import type { AnchorQueryPort, AnchorSubmissionPort } from "../anchor/anchor.port";
@@ -7,6 +7,7 @@ import type { BindingRecord, TransactionRecord } from "../shared/repository.type
 import type { WalletRepository } from "../wallet/wallet.repository";
 import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import { SUPPORTED_CHAIN_IDS } from "./chain-registry";
+import { NORMALIZATION_RULES_VERSION } from "./normalization-rules";
 import type { SyncCursorRepository } from "./sync-cursor.repository";
 import type { TransactionSyncRepository } from "./transaction.repository";
 import { CHAIN_INDEXER, SYNC_CURSOR_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
@@ -27,6 +28,7 @@ const sanitize = (message: unknown): string | undefined =>
 
 @Injectable()
 export class IndexerService {
+  private readonly logger = new Logger(IndexerService.name);
   // Per-user promise coalescer. Each entry is tagged with its work-set mode so a forced
   // all-binding refresh is never satisfied by an in-flight subset bootstrap.
   private readonly inflight = new Map<string, { mode: SyncMode; promise: Promise<SyncResult> }>();
@@ -146,7 +148,22 @@ export class IndexerService {
       try {
         const cursors = await this.cursors.listForBinding(binding.id);
         const sinceByChain: Record<number, bigint> = {};
-        for (const cursor of cursors) sinceByChain[cursor.chainId] = cursor.lastSyncedBlock;
+        const rewalk: number[] = [];
+        for (const cursor of cursors) {
+          // A cursor walked under older normalization rules is stale evidence, not progress: its rows carry
+          // judgments the current rules would not make (a forged "EТH" send indexed before the forgery rule
+          // stayed SEND). Leaving the chain out of `sinceByChain` walks it from genesis again; the
+          // edit-preserving upsert and the superseded-row purge below turn that into corrections rather
+          // than duplicates. See normalization-rules.ts.
+          if (cursor.rulesVersion < NORMALIZATION_RULES_VERSION) {
+            rewalk.push(cursor.chainId);
+            continue;
+          }
+          sinceByChain[cursor.chainId] = cursor.lastSyncedBlock;
+        }
+        if (rewalk.length > 0) {
+          this.logger.log(`binding ${binding.id}: re-walking chain(s) ${rewalk.join(", ")} from genesis — cursor rules version is behind ${NORMALIZATION_RULES_VERSION}.`);
+        }
 
         const { transactions, chainHeads } = await this.indexer.fetchTransactions(binding.walletAddress, sinceByChain);
         fetched += transactions.length;
@@ -199,7 +216,7 @@ export class IndexerService {
         for (const chainId of SUPPORTED_CHAIN_IDS) {
           const head = chainHeads[chainId];
           if (head === undefined) skipped.push({ bindingId: binding.id, chainId, code: "chain_incomplete" });
-          else await this.cursors.advance(binding.id, chainId, BigInt(head));
+          else await this.cursors.advance(binding.id, chainId, BigInt(head), NORMALIZATION_RULES_VERSION);
         }
 
         // Anchor submission is reserved for verified (siwe) bindings; watch-only rows
