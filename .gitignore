@@ -10,3 +10,5 @@ packages/*/node_modules
 apps/backend/prisma/dev.db
 
 .gjc/
+# 로컬 전환 실험이 남기는 .env 백업(비밀키 포함) — 절대 커밋하지 않는다.
+.env.bak-*

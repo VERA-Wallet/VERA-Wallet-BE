@@ -20,6 +20,9 @@ describe("VERA Wallet mock journey", () => {
     // PERSISTENCE는 MOCK_MODE보다 우선한다. 로컬 .env가 prisma로 켜져 있으면 이 테스트가 개발용 DB에
     // 붙어 버려서, 이전 실행이 남긴 행까지 세느라 건수 단언이 깨진다. 여기서 인메모리로 못박는다.
     process.env.PERSISTENCE = "memory";
+    // IDENTITY_PROVIDER도 MOCK_MODE보다 우선한다. 로컬 .env가 omnione_cx면 이 여정의 첫 걸음인
+    // /auth/verify/callback이 실제 CX 서버에 토큰을 물어보러 가서 401로 끊긴다 — mock 여정이므로 못박는다.
+    process.env.IDENTITY_PROVIDER = "mock";
     process.env.JWT_SECRET = "test-only-verawallet-secret-at-least-32-chars";
     const module = await Test.createTestingModule({ imports: [AppModule] }).compile();
     app = module.createNestApplication();
