@@ -1,4 +1,4 @@
-import { Injectable, ServiceUnavailableException } from "@nestjs/common";
+import { Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import type { AnchorInspection, AnchorReceipt, AnchorType, EvidenceAnchor } from "@vera/interfaces";
 import { createPublicClient, createWalletClient, encodeAbiParameters, http, keccak256, toBytes, toFunctionSelector, type Chain, type Hex } from "viem";
@@ -58,8 +58,16 @@ const ANCHOR_CONTRACT_ABI = [{ type: "function", name: "anchor", stateMutability
 
 @Injectable()
 export class OmniOneChainAdapter implements EvidenceAnchor {
-  constructor(private readonly config: ConfigService) {}
+  private readonly logger = new Logger(OmniOneChainAdapter.name);
 
+  constructor(private readonly config: ConfigService) {
+    // 어느 경로로 올리는지 부팅 때 한 번 말한다. .env만 바꾸고 프로세스를 안 띄우면 옛 모드로 조용히 돌기 때문이다 —
+    // 실제로 컨트랙트 주소를 넣고도 자기 주소 전송이 계속 나간 적이 있다.
+    const contract = this.config.get<string>("ANCHOR_CONTRACT_ADDRESS")?.trim();
+    this.logger.log(
+      `OmniOne anchor mode: ${contract ? `contract ${contract}` : "self-send calldata (ANCHOR_CONTRACT_ADDRESS 비어 있음)"} · chainId ${this.config.get("OMNIONE_CHAIN_ID", "201210")}`,
+    );
+  }
   private chain(): Chain {
     return defineChain({ id: Number(this.config.get("OMNIONE_CHAIN_ID", "201210")), name: "OmniOne Chain", nativeCurrency: { name: "Gasless", symbol: "GAS", decimals: 18 }, rpcUrls: { default: { http: [this.config.get("OMNIONE_RPC_URL", "https://stage-chainapi.omnione.net")] } } });
   }
