@@ -1,4 +1,5 @@
 import type { SyncResult } from "./indexer.service";
+import type { SyncProgress } from "./sync-progress";
 
 /**
  * 비동기 동기화 작업.
@@ -18,6 +19,8 @@ export type SyncJobRecord = {
   updatedAt: Date;
   result?: SyncResult;
   error?: SyncJobError;
+  /** 진행 중 인덱서가 보고한 (지갑, 체인)별 진척. 끝난 뒤에도 남겨 두어 마지막 모습을 볼 수 있다. */
+  progress?: SyncProgress;
 };
 
 export interface SyncJobStore {
@@ -25,7 +28,7 @@ export interface SyncJobStore {
   get(id: string): SyncJobRecord | undefined;
   /** 아직 끝나지 않은(queued/running) 같은 사용자의 작업. 중복 실행을 막는 근거. */
   findActiveForUser(userId: string): SyncJobRecord | undefined;
-  update(id: string, patch: Partial<Pick<SyncJobRecord, "status" | "result" | "error">>): SyncJobRecord;
+  update(id: string, patch: Partial<Pick<SyncJobRecord, "status" | "result" | "error" | "progress">>): SyncJobRecord;
 }
 
 export interface SyncDispatcher {
@@ -68,7 +71,7 @@ export class InMemorySyncJobStore implements SyncJobStore {
     return undefined;
   }
 
-  update(id: string, patch: Partial<Pick<SyncJobRecord, "status" | "result" | "error">>): SyncJobRecord {
+  update(id: string, patch: Partial<Pick<SyncJobRecord, "status" | "result" | "error" | "progress">>): SyncJobRecord {
     const current = this.jobs.get(id);
     if (!current) throw new Error(`Unknown sync job ${id}`);
     const next: SyncJobRecord = { ...current, ...patch, updatedAt: this.now() };
