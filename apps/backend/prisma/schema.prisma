@@ -14,6 +14,7 @@ model User {
   verifications IdentityVerification[]
   bindings      WalletBinding[]
   reports       TaxReport[]
+  evidence      TaxEvidence[]
 }
 
 model IdentityVerification {
@@ -139,4 +140,24 @@ model AnchorRecord {
 
   // Privacy boundary: intentionally no User relation or userId column.
   @@index([status])
+}
+
+/// 사용자가 체인에 봉인한 계산 근거의 정본.
+///
+/// 체인에는 `merkleRoot`만 올라가고(AnchorRecord의 프라이버시 경계는 그대로다), 그 루트가
+/// 무엇을 덮는지는 여기 남는다 — 나중에 거래 하나의 판정을 머클 증명으로 보이려면 원본이 있어야 한다.
+model TaxEvidence {
+  id          String   @id @default(uuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id])
+  countryCode String
+  taxYear     Int
+  merkleRoot  String
+  leafCount   Int
+  document    Json
+  createdAt   DateTime @default(now())
+
+  // 같은 근거를 다시 올려도 기록은 하나다(앵커도 payloadHash 기준으로 이미 멱등이다).
+  @@unique([userId, merkleRoot])
+  @@index([userId, countryCode, taxYear])
 }

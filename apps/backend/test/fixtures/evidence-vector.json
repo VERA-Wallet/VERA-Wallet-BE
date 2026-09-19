@@ -1,0 +1,152 @@
+{
+  "note": "FE lib/tax/evidence.ts와 BE src/evidence/evidence.merkle.ts가 같은 루트를 내는지 고정하는 벡터. 두 곳 모두 이 파일을 읽는다.",
+  "merkleRoot": "0x9292fe023cf726b17dbbaf55b7b7ba970f745937d786fe66d3589af2c86441c0",
+  "leafHashes": [
+    "0xdf17afdc8f9599d30ef9d672ab201885acf69fca42c019573acf6b6db0eba089",
+    "0x9d368de7ae26e5d8c08424479948a6dd0f7f15b3bc724509c608fa9b0a7efba9",
+    "0x9c005015b5d0ec5aa2ce62b145dc34f5fe72525c2391ecbb8b683bc6b57a1843",
+    "0x53fedd42edae619a56e310569002dae087d27a7b8cc2756986384e764691ee36",
+    "0x54ac18ae587622d9106456b9f941686e305574c340b4338dc9381521f9de6b70",
+    "0xaacc1c50652fe53cdc386cc2def252ef66f885241b142b0628d39e8ea38b6864"
+  ],
+  "leaves": [
+    {
+      "kind": "header",
+      "version": 1,
+      "country": "KR",
+      "countryLabel": "한국",
+      "currency": "KRW",
+      "taxYear": 2027,
+      "method": "거주자별 총평균법",
+      "status": "PARTIAL",
+      "period": {
+        "from": "2027-01-01T00:00:00.000Z",
+        "to": "2028-01-01T00:00:00.000Z"
+      },
+      "lines": [
+        {
+          "key": "basic_deduction",
+          "label": "기본공제",
+          "amount": "2500000",
+          "rate": "연 250만원"
+        },
+        {
+          "key": "income_tax",
+          "label": "소득세",
+          "amount": "166666.67",
+          "rate": "20%",
+          "basis": "소득세법 제64조의3제2항"
+        },
+        {
+          "key": "local_tax",
+          "label": "개인지방소득세",
+          "amount": "16666.67"
+        }
+      ],
+      "totals": {
+        "taxableGains": "833333.33",
+        "exemptGains": "0",
+        "incomeTotal": "1200000",
+        "taxableBase": "833333.33",
+        "estimatedCharge": "183333.34",
+        "effectiveRatePercent": "5.5"
+      },
+      "lossCarryforward": "0",
+      "judgmentCount": 5
+    },
+    {
+      "kind": "judgment",
+      "eventId": "evt-acquire",
+      "at": "2026-04-01T00:00:00.000Z",
+      "asset": "1:native",
+      "symbol": "ETH",
+      "quantity": "5",
+      "amount": "9000000",
+      "amountKind": "cost",
+      "group": "acquire",
+      "label": "취득 · 원가 추적",
+      "basis": "소득세법 제37조",
+      "leg": "single",
+      "lots": 1,
+      "inPeriod": false
+    },
+    {
+      "kind": "judgment",
+      "eventId": "evt-income",
+      "at": "2027-02-02T00:00:00.000Z",
+      "asset": "42161:0x912c",
+      "symbol": "ARB",
+      "quantity": "800",
+      "amount": "1200000",
+      "amountKind": "fmv",
+      "group": "income",
+      "label": "소득 · 수령 시점 FMV",
+      "basis": "소득세법 제21조",
+      "leg": "single",
+      "lots": 0,
+      "inPeriod": true
+    },
+    {
+      "kind": "judgment",
+      "eventId": "evt-dispose",
+      "at": "2027-06-01T02:30:00.000Z",
+      "asset": "1:native",
+      "symbol": "ETH",
+      "quantity": "3.5",
+      "amount": "12000000",
+      "amountKind": "gain",
+      "group": "taxable",
+      "label": "과세 · 기타소득 20%",
+      "basis": "소득세법 제21조제1항제27호",
+      "leg": "single",
+      "lots": 2,
+      "inPeriod": true,
+      "holdingDays": 420,
+      "acquiredAt": "2026-04-01T00:00:00.000Z",
+      "breakdown": {
+        "proceeds": "21000000",
+        "cost": "8800000",
+        "fee": "200000"
+      }
+    },
+    {
+      "kind": "judgment",
+      "eventId": "evt-swap",
+      "at": "2027-08-08T10:00:00.000Z",
+      "asset": "1:native",
+      "symbol": "ETH",
+      "quantity": "2.4",
+      "amount": "16500000",
+      "amountKind": "cost",
+      "group": "acquire",
+      "label": "취득 · 교환 수취",
+      "basis": "소득세법 제37조",
+      "leg": "receive",
+      "lots": 1,
+      "inPeriod": true
+    },
+    {
+      "kind": "judgment",
+      "eventId": "evt-swap",
+      "at": "2027-08-08T10:00:00.000Z",
+      "asset": "1:0xa0b8",
+      "symbol": "USDC",
+      "quantity": "12000",
+      "amount": "4500000",
+      "amountKind": "gain",
+      "group": "taxable",
+      "label": "과세 · 기타소득 20%",
+      "basis": "소득세법 제21조제1항제27호",
+      "leg": "dispose",
+      "lots": 1,
+      "inPeriod": true,
+      "holdingDays": 90,
+      "acquiredAt": "2027-04-12T00:00:00.000Z",
+      "breakdown": {
+        "proceeds": "16500000",
+        "cost": "11900000",
+        "fee": "100000"
+      }
+    }
+  ]
+}

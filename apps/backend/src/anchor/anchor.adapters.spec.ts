@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { ServiceUnavailableException } from "@nestjs/common";
 import type { ConfigService } from "@nestjs/config";
-import { MockAnchorAdapter, OmniOneChainAdapter, rpcAuthHeaders } from "./anchor.adapters";
+import { MockAnchorAdapter, OmniOneChainAdapter, payloadHashFromInput, rpcAuthHeaders } from "./anchor.adapters";
+import { encodeAbiParameters, encodeFunctionData } from "viem";
 
 describe("MockAnchorAdapter", () => {
   it("records and verifies generated transaction hashes", async () => {
@@ -32,3 +33,23 @@ describe("OmniOne RPC 인증 헤더", () => {
   });
 });
 
+describe("체인 calldata에서 payload 해시 읽기", () => {
+  const root = `0x${"ab".repeat(32)}` as const;
+  const ABI = [{ type: "function", name: "anchor", stateMutability: "nonpayable", inputs: [{ name: "payloadHash", type: "bytes32" }, { name: "anchorType", type: "string" }], outputs: [] }] as const;
+
+  it("자기 주소 전송(컨트랙트 없음): 맨 앞 bytes32", () => {
+    const input = encodeAbiParameters([{ type: "bytes32" }, { type: "string" }], [root, "rule_version"]);
+    expect(payloadHashFromInput(input)).toBe(root);
+  });
+
+  it("컨트랙트 호출(ANCHOR_CONTRACT_ADDRESS 설정): 셀렉터 다음 bytes32 — 맨 앞을 읽으면 셀렉터가 섞인다", () => {
+    const input = encodeFunctionData({ abi: ABI, functionName: "anchor", args: [root, "rule_version"] });
+    expect(input.slice(0, 10)).not.toBe(`0x${root.slice(2, 10)}`);
+    expect(payloadHashFromInput(input)).toBe(root);
+  });
+
+  it("너무 짧은 calldata는 해시가 아니다", () => {
+    expect(payloadHashFromInput("0x")).toBeNull();
+    expect(payloadHashFromInput("0x1234")).toBeNull();
+  });
+});

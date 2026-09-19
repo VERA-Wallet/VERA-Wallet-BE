@@ -10,6 +10,7 @@ import { TaxModule } from "./tax/tax.module";
 import { WalletModule } from "./wallet/wallet.module";
 import { AppController } from "./app.controller";
 import { AnchorModule } from "./anchor/anchor.module";
+import { TaxEvidenceModule } from "./evidence/evidence.module";
 
 const queueImports = process.env.MOCK_MODE === "false"
   ? [BullModule.forRootAsync({
@@ -22,7 +23,7 @@ const queueImports = process.env.MOCK_MODE === "false"
   : [];
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, PortfolioModule, TaxModule, ReportModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, PortfolioModule, TaxModule, ReportModule, TaxEvidenceModule],
   controllers: [AppController],
 })
 export class AppModule {}
