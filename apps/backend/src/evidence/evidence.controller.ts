@@ -43,8 +43,9 @@ export class TaxEvidenceController {
   }
 
   /**
-   * 루트가 덮고 있는 정본 문서. 체인에는 해시만 있으므로, 나중에 건별 판정을 증명하려면
-   * 이 원본에서 잎과 경로를 다시 만들어야 한다 — 그래서 올린 사람만 열 수 있게 둔다.
+   * 루트가 덮고 있는 정본 문서 + 기록 정보(거래 해시·블록·시각). 체인에는 해시만 있으므로,
+   * 근거 화면이 "체인의 해시 ← 머클루트 ← 이 판정들"을 보이고 건별 증명을 다시 만들려면
+   * 이 원본이 필요하다 — 그래서 올린 사람만 열 수 있게 둔다.
    */
   @Get(":merkleRoot")
   async document(@CurrentUser() user: AuthenticatedUser, @Param("merkleRoot") merkleRoot: string) {

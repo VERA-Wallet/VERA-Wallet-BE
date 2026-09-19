@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Injectable } from "@nestjs/common";
 import { PrismaService } from "../shared/prisma.service";
-import type { TaxEvidenceRecordView, TaxEvidenceRepository } from "./evidence.repository";
+import type { TaxEvidenceDocumentView, TaxEvidenceRecordView, TaxEvidenceRepository } from "./evidence.repository";
 
 type StoredEvidence = TaxEvidenceRecordView & { userId: string; document: unknown };
 
@@ -26,8 +26,9 @@ export class MockTaxEvidenceRepository implements TaxEvidenceRepository {
     return matches[0] ? view(matches[0]) : null;
   }
 
-  async findDocument(userId: string, merkleRoot: string) {
-    return this.records.get(key(userId, merkleRoot))?.document ?? null;
+  async findByRoot(userId: string, merkleRoot: string): Promise<TaxEvidenceDocumentView | null> {
+    const record = this.records.get(key(userId, merkleRoot));
+    return record ? { ...view(record), document: record.document } : null;
   }
 }
 
@@ -56,8 +57,7 @@ export class PrismaTaxEvidenceRepository implements TaxEvidenceRepository {
     return this.prisma.taxEvidence.findFirst({ where: { userId, countryCode, taxYear }, orderBy: { createdAt: "desc" }, select: SELECT });
   }
 
-  async findDocument(userId: string, merkleRoot: string) {
-    const record = await this.prisma.taxEvidence.findUnique({ where: { userId_merkleRoot: { userId, merkleRoot } }, select: { document: true } });
-    return record?.document ?? null;
+  findByRoot(userId: string, merkleRoot: string): Promise<TaxEvidenceDocumentView | null> {
+    return this.prisma.taxEvidence.findUnique({ where: { userId_merkleRoot: { userId, merkleRoot } }, select: { ...SELECT, document: true } });
   }
 }

@@ -4,7 +4,7 @@ import { ANCHOR_QUERY, ANCHOR_SUBMISSION } from "../anchor/anchor.tokens";
 import { omnioneExplorerTxUrl } from "../shared/omnione-explorer";
 import type { RecordEvidenceDto } from "./evidence.dto";
 import { merkleRoot } from "./evidence.merkle";
-import type { TaxEvidenceRecordView, TaxEvidenceRepository } from "./evidence.repository";
+import type { TaxEvidenceDocumentView, TaxEvidenceRecordView, TaxEvidenceRepository } from "./evidence.repository";
 import { TAX_EVIDENCE_REPOSITORY } from "./evidence.tokens";
 
 /**
@@ -44,6 +44,12 @@ export type EvidenceView = {
   anchoredAt: string | null;
   explorerUrl: string | null;
 };
+
+/**
+ * 기록 + 그 루트가 덮는 정본 문서. 근거 화면이 "체인의 해시 ← 루트 ← 이 잎들"을 한 자리에서
+ * 보이려면 둘을 따로 두 번 묻게 하지 않는다 — 잎은 저장한 그대로 돌려주고 해석은 화면이 한다.
+ */
+export type EvidenceDocumentView = EvidenceView & { version: number; leaves: Record<string, unknown>[] };
 
 /**
  * 계산 근거를 OmniOne 체인에 올리는 사용 사례.
@@ -102,8 +108,11 @@ export class TaxEvidenceService {
     return record ? this.view(record) : null;
   }
 
-  async document(userId: string, merkleRoot: string) {
-    return this.evidence.findDocument(userId, merkleRoot);
+  /** 루트가 덮는 정본 문서를 기록 정보와 함께. 올린 사람의 것만 — 남의 루트는 null. */
+  async document(userId: string, merkleRoot: string): Promise<EvidenceDocumentView | null> {
+    const record = await this.evidence.findByRoot(userId, merkleRoot);
+    if (!record) return null;
+    return { ...(await this.view(record)), ...storedDocument(record) };
   }
 
   /**
@@ -113,9 +122,8 @@ export class TaxEvidenceService {
    * 그 해시를 갖고 있는 것은 별개이고, 이 체인에는 탐색기가 없어 사용자가 스스로 확인할 길이 없다.
    */
   async checkChain(userId: string, merkleRoot: string): Promise<EvidenceChainCheck | null> {
-    const document = await this.evidence.findDocument(userId, merkleRoot);
     // 남의 근거를 체인에서 대신 조회해 주지 않는다 — 소유 확인이 먼저다.
-    if (document === null) return null;
+    if ((await this.evidence.findByRoot(userId, merkleRoot)) === null) return null;
 
     const anchor = await this.anchorQuery.get(merkleRoot);
     const checkedAt = new Date().toISOString();
@@ -155,4 +163,15 @@ export class TaxEvidenceService {
       explorerUrl: anchor?.chainTxHash ? omnioneExplorerTxUrl(anchor.chainTxHash) : null,
     };
   }
+}
+
+/**
+ * 저장된 JSON에서 문서 부분만 꺼낸다. 저장 시 `{ version, leaves }`로 넣었지만 DB 컬럼은 Json이라
+ * 타입이 없다 — 형태가 다르면 빈 문서로 답해 화면이 "잎이 없다"를 그대로 말하게 둔다(지어내지 않는다).
+ */
+function storedDocument(record: TaxEvidenceDocumentView): { version: number; leaves: Record<string, unknown>[] } {
+  const stored = (record.document ?? {}) as { version?: unknown; leaves?: unknown };
+  const version = typeof stored.version === "number" ? stored.version : 1;
+  const leaves = Array.isArray(stored.leaves) ? (stored.leaves as Record<string, unknown>[]) : [];
+  return { version, leaves };
 }

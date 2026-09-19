@@ -129,7 +129,11 @@ describe("계산 근거 앵커", () => {
 
   it("정본 원본은 올린 사람만 열 수 있다 — 건별 증명을 다시 만들 유일한 소스다", async () => {
     await service.record(USER, body());
-    expect(await service.document(USER, vector.merkleRoot)).toMatchObject({ version: 1 });
+    const document = await service.document(USER, vector.merkleRoot);
+    // 잎은 저장한 그대로 돌아오고, 기록 정보(루트·거래 해시·블록)가 함께 실린다 — 근거 화면이 한 번에 그린다.
+    expect(document).toMatchObject({ version: 1, merkleRoot: vector.merkleRoot, anchorStatus: "anchored", blockNumber: "42" });
+    expect(document!.leaves).toEqual(vector.leaves);
+    expect(document!.txHash).toMatch(/^0x[0-9a-f]{64}$/);
     expect(await service.document("other-user", vector.merkleRoot)).toBeNull();
   });
 
