@@ -36,8 +36,35 @@ export interface ChainScanResult {
   chainHeads: Record<number, number>;
 }
 
+/** One chain's complete observation: transfers, recovered native legs and normalization all done. */
+export interface ChainScanOutcome {
+  chainId: number;
+  head: number;
+  transactions: IndexedTransaction[];
+}
+
+/** Where one chain's scan currently is. `fetched` counts raw transfers pulled so far. */
+export interface ChainScanProgress {
+  chainId: number;
+  phase: "fetching" | "tracing";
+  fetched: number;
+  traced?: { done: number; total: number };
+}
+
+/**
+ * Optional streaming side of a scan. An adapter that can finish chains independently hands each one
+ * over the moment it is complete, so the caller can persist it before the slower chains finish. The
+ * aggregate `ChainScanResult` is still returned, for callers and adapters that do not stream.
+ */
+export interface ChainScanHooks {
+  onChain?(outcome: ChainScanOutcome): void | Promise<void>;
+  onProgress?(progress: ChainScanProgress): void;
+  /** A chain was withheld (incomplete or failed), with the reason the adapter would otherwise only log. */
+  onChainError?(chainId: number, message: string): void;
+}
+
 export interface ChainIndexer {
-  fetchTransactions(address: string, sinceByChain?: Record<number, bigint>): Promise<ChainScanResult>;
+  fetchTransactions(address: string, sinceByChain?: Record<number, bigint>, hooks?: ChainScanHooks): Promise<ChainScanResult>;
 }
 
 export interface IndexedTransaction {

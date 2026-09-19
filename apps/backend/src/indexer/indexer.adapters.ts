@@ -1,6 +1,6 @@
 import { Injectable, Logger, ServiceUnavailableException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import type { ChainIndexer, ChainScanResult, IndexedTransaction } from "@vera/interfaces";
+import type { ChainIndexer, ChainScanHooks, ChainScanResult, IndexedTransaction } from "@vera/interfaces";
 import { CHAIN_REGISTRY, SUPPORTED_CHAIN_IDS, type ChainRegistryEntry, type NativeValueSource } from "./chain-registry";
 import { extractNativeTransfers, isTraceCapabilityError, unwrapTraceResult } from "./native-trace";
 import {
@@ -35,10 +35,31 @@ const BALANCE_DIFF_CONCURRENCY = 3;
 // plan upgrade starts producing native legs the same day without a restart.
 const NATIVE_SOURCE_REPROBE_MS = 6 * 60 * 60 * 1_000;
 // 429 (rate limited) is retried with Retry-After or exponential backoff; other failures are chain-fatal as before.
-const RATE_LIMIT_RETRIES = 3;
+// Six attempts (0.5s → 1 → 2 → 4 → 8 → 10s cap, ~25s total) instead of three: a full re-walk of a large wallet
+// issues thousands of native-recovery reads on top of the paged transfers, and with three retries (2s max) a
+// 429 storm on `eth_getBalance` withheld Arbitrum on every sync, so its cursor never advanced and each run
+// re-walked the chain from genesis only to hit the same wall. The budget is per request; unrelated requests
+// keep flowing while one waits.
+const RATE_LIMIT_RETRIES = 6;
 const DEFAULT_RETRY_BASE_MS = 500;
+const MAX_RETRY_DELAY_MS = 10_000;
+// Gateway errors share the budget: under the same load Alchemy answers some reads with 502/503/504 instead of
+// 429, and one such answer among thousands withheld a whole chain (arb-mainnet eth_getBalance HTTP 503).
+// 500 and the rest stay fatal — they describe the request, not the moment.
+const RETRYABLE_STATUSES: ReadonlySet<number> = new Set([429, 502, 503, 504]);
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** Peek (without consuming) whether a response body is a JSON-RPC error envelope. */
+async function carriesRpcError(response: Response): Promise<boolean> {
+  if (typeof response.clone !== "function") return false;
+  try {
+    const body = (await response.clone().json()) as { error?: unknown } | null;
+    return typeof body?.error === "object" && body.error !== null;
+  } catch {
+    return false;
+  }
+}
 
 /** Run `work` over `items` with at most `limit` in flight; results keep the input order. */
 async function mapWithConcurrency<T, R>(items: readonly T[], limit: number, work: (item: T) => Promise<R>): Promise<R[]> {
@@ -65,7 +86,7 @@ const SWAP_CONFIDENCE = 0.6;
 export class MockAlchemyAdapter implements ChainIndexer {
   // Deterministic per-call-incrementing head so a manual resync advances cursors in the mock path.
   private syncCount = 0;
-  async fetchTransactions(address: string, _sinceByChain?: Record<number, bigint>): Promise<ChainScanResult> {
+  async fetchTransactions(address: string, _sinceByChain?: Record<number, bigint>, hooks?: ChainScanHooks): Promise<ChainScanResult> {
     this.syncCount += 1;
     const transactions: IndexedTransaction[] = Array.from({ length: 25 }, (_, index) => {
       const n = index + 1;
@@ -97,6 +118,13 @@ export class MockAlchemyAdapter implements ChainIndexer {
     });
     const chainHeads: Record<number, number> = {};
     for (const chainId of SUPPORTED_CHAIN_IDS) chainHeads[chainId] = 1000 + this.syncCount;
+    // 실어댑터와 같은 스트리밍 계약: 체인 하나씩 넘긴다. 서비스는 넘겨받은 체인을 먼저 저장하고, 아래 집계 결과에서
+    // 그 체인을 다시 저장하지 않는다 — mock·e2e 경로도 실제와 같은 순서로 저장·커서 전진을 밟게 된다.
+    for (const chainId of SUPPORTED_CHAIN_IDS) {
+      const scoped = transactions.filter((item) => Number(item.chain) === chainId);
+      hooks?.onProgress?.({ chainId, phase: "fetching", fetched: scoped.length });
+      await hooks?.onChain?.({ chainId, head: chainHeads[chainId], transactions: scoped });
+    }
     return { transactions, chainHeads };
   }
 }
@@ -126,6 +154,17 @@ class ChainIncompleteError extends Error {}
  * normalized without recovered native legs and the degradation is logged once.
  */
 class NativeSourceUnavailableError extends Error {}
+
+/**
+ * One state read the provider will not serve for THAT block: on Alchemy's Arbitrum endpoint `eth_getBalance`
+ * at blocks older than the key's archive depth answers HTTP 503 with JSON-RPC -32001 "Unable to complete
+ * request at this time." — deterministically, while the same read at a recent block succeeds. It is neither
+ * a chain outage (withholding the chain would re-walk it from genesis on every sync only to hit the same
+ * wall) nor a plan-wide gate on the source (recent transactions still recover fine), so it is handled per
+ * candidate: that transaction's native leg is skipped, the rest of the chain proceeds.
+ */
+class ArchiveDepthError extends Error {}
+const ARCHIVE_DEPTH_RPC_CODE = -32001;
 
 interface AlchemyTransfer {
   uniqueId?: unknown;
@@ -203,7 +242,7 @@ export class AlchemyAdapter implements ChainIndexer {
 
   constructor(private readonly config: ConfigService) {}
 
-  async fetchTransactions(address: string, sinceByChain?: Record<number, bigint>): Promise<ChainScanResult> {
+  async fetchTransactions(address: string, sinceByChain?: Record<number, bigint>, hooks?: ChainScanHooks): Promise<ChainScanResult> {
     const apiKey = this.config.get<string>("ALCHEMY_API_KEY");
     if (!apiKey) throw new ServiceUnavailableException("Alchemy real adapter requires ALCHEMY_API_KEY.");
 
@@ -222,6 +261,12 @@ export class AlchemyAdapter implements ChainIndexer {
         // Snapshot ONE head before both directions and pass the same toBlock to each,
         // so a later direction can never advance past a block an earlier direction did
         // not scan (fixes IN/OUT head drift). Cursor advances only to this proven horizon.
+        // Progress is reported per chain as it happens (pages pulled, transactions traced) so a caller
+        // can show a big wallet moving instead of a bare "running". `pulled` is raw transfers so far.
+        let pulled = 0;
+        const report = (phase: "fetching" | "tracing", traced?: { done: number; total: number }) =>
+          hooks?.onProgress?.({ chainId: entry.chainId, phase, fetched: pulled, ...(traced ? { traced } : {}) });
+        report("fetching");
         const head = await this.fetchChainHead(entry, url);
         const toBlock = `0x${head.toString(16)}`;
         const since = sinceByChain?.[entry.chainId];
@@ -229,15 +274,21 @@ export class AlchemyAdapter implements ChainIndexer {
 
         // Independent direction calls (separate diagnostics). Either throwing, OR
         // any normalization skip inside normalizeChain, withholds the whole chain.
-        const inbound = await this.fetchDirection(entry, url, { toAddress: address }, fromBlock, toBlock);
-        const outbound = await this.fetchDirection(entry, url, { fromAddress: address }, fromBlock, toBlock);
+        const inbound = await this.fetchDirection(entry, url, { toAddress: address }, fromBlock, toBlock, (count) => { pulled = count; report("fetching"); });
+        const inboundCount = inbound.length;
+        const outbound = await this.fetchDirection(entry, url, { fromAddress: address }, fromBlock, toBlock, (count) => { pulled = inboundCount + count; report("fetching"); });
         // Chains without Alchemy's `internal` category recover native-value legs by tracing the
         // transactions the two direction calls already proved the wallet took part in. A trace
         // failure throws, so it lands in this same catch and withholds the WHOLE chain — never a
         // silent half-observation that would persist a swap as a bare SEND.
-        const traced = await this.recoverNativeLegs(entry, url, wallet, [...inbound, ...outbound], fromBlock !== undefined);
-        return { entry, head, transactions: this.normalizeChain(entry, address, wallet, inbound, outbound, traced) };
+        const traced = await this.recoverNativeLegs(entry, url, wallet, [...inbound, ...outbound], fromBlock !== undefined, (done, total) => report("tracing", { done, total }));
+        const transactions = this.normalizeChain(entry, address, wallet, inbound, outbound, traced);
+        // Hand the finished chain over right away; the caller may persist it while other chains are
+        // still being scanned. The aggregate result below still carries it for non-streaming callers.
+        await hooks?.onChain?.({ chainId: entry.chainId, head, transactions });
+        return { entry, head, transactions };
       } catch (error) {
+        hooks?.onChainError?.(entry.chainId, (error as Error).message);
         return { entry, error: error as Error };
       }
     });
@@ -264,19 +315,23 @@ export class AlchemyAdapter implements ChainIndexer {
   }
 
   /**
-   * One JSON-RPC POST with rate-limit retry. 429 is the only status retried: it is Alchemy telling us to slow
-   * down, not a broken chain. Retry-After (seconds) wins when present; otherwise exponential backoff from
-   * ALCHEMY_RETRY_BASE_MS (default 500ms). Anything else is returned as-is for the caller's chain-fatal handling.
+   * One JSON-RPC POST with retry for the transient statuses (RETRYABLE_STATUSES): 429 is Alchemy telling us to
+   * slow down and 502/503/504 are its gateway buckling under the same load — neither describes a broken chain.
+   * Retry-After (seconds) wins when present; otherwise exponential backoff from ALCHEMY_RETRY_BASE_MS
+   * (default 500ms), capped at MAX_RETRY_DELAY_MS. Anything else is returned as-is for the caller's chain-fatal handling.
    */
   private async rpcPost(url: string, body: Record<string, unknown>): Promise<Response> {
     const configured = Number(this.config.get<string>("ALCHEMY_RETRY_BASE_MS"));
     const baseDelay = Number.isFinite(configured) && configured >= 0 && this.config.get<string>("ALCHEMY_RETRY_BASE_MS") !== undefined ? configured : DEFAULT_RETRY_BASE_MS;
     for (let attempt = 0; ; attempt += 1) {
       const response = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
-      if (response.status !== 429 || attempt >= RATE_LIMIT_RETRIES) return response;
+      if (!RETRYABLE_STATUSES.has(response.status) || attempt >= RATE_LIMIT_RETRIES) return response;
+      // A 5xx that carries a JSON-RPC error body is an answer, not a gateway hiccup (the archive-depth 503 above);
+      // retrying it only burns the budget. 429 never carries one worth reading.
+      if (response.status !== 429 && (await carriesRpcError(response))) return response;
       const retryAfter = Number(response.headers?.get?.("retry-after"));
-      const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : baseDelay * 2 ** attempt;
-      this.logger.warn(`Alchemy rate limited (429); retry ${attempt + 1}/${RATE_LIMIT_RETRIES} in ${delay}ms`);
+      const delay = Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter * 1_000 : Math.min(baseDelay * 2 ** attempt, MAX_RETRY_DELAY_MS);
+      this.logger.warn(`Alchemy ${response.status === 429 ? "rate limited (429)" : `transient HTTP ${response.status}`}; retry ${attempt + 1}/${RATE_LIMIT_RETRIES} in ${delay}ms`);
       await sleep(delay);
     }
   }
@@ -302,6 +357,7 @@ export class AlchemyAdapter implements ChainIndexer {
     selector: { toAddress?: string; fromAddress?: string },
     fromBlock: string | undefined,
     toBlock: string,
+    onPage?: (collected: number) => void,
   ): Promise<AlchemyTransfer[]> {
     const collected: AlchemyTransfer[] = [];
     const seenPageKeys = new Set<string>();
@@ -333,6 +389,7 @@ export class AlchemyAdapter implements ChainIndexer {
       const { transfers, pageKey: nextPageKey } = result as { transfers?: unknown; pageKey?: unknown };
       if (!Array.isArray(transfers)) throw new Error(`${entry.network} malformed response: transfers not an array`);
       collected.push(...(transfers as AlchemyTransfer[]));
+      onPage?.(collected.length);
 
       if (nextPageKey === undefined || nextPageKey === null || nextPageKey === "") return collected; // terminal page
       if (typeof nextPageKey !== "string") throw new Error(`${entry.network} malformed response: non-string pageKey`);
@@ -366,6 +423,7 @@ export class AlchemyAdapter implements ChainIndexer {
     wallet: string,
     observed: AlchemyTransfer[],
     incremental: boolean,
+    onTrace?: (done: number, total: number) => void,
   ): Promise<AlchemyTransfer[]> {
     if (entry.nativeSources.length === 0) return [];
     const candidates = this.nativeCandidates(wallet, observed);
@@ -375,8 +433,8 @@ export class AlchemyAdapter implements ChainIndexer {
       if (this.isSourceUnavailable(entry, source)) continue;
       const legs =
         source === "alchemy-debug"
-          ? await this.fetchNativeTraceLegs(entry, url, wallet, candidates, incremental)
-          : await this.fetchBalanceDiffLegs(entry, url, wallet, candidates, incremental);
+          ? await this.fetchNativeTraceLegs(entry, url, wallet, candidates, incremental, onTrace)
+          : await this.fetchBalanceDiffLegs(entry, url, wallet, candidates, incremental, onTrace);
       if (legs !== null) return legs;
     }
     return [];
@@ -420,10 +478,12 @@ export class AlchemyAdapter implements ChainIndexer {
     wallet: string,
     candidates: ReadonlyMap<string, string>,
     incremental: boolean,
+    onTrace?: (done: number, total: number) => void,
   ): Promise<AlchemyTransfer[] | null> {
     this.logger.debug(`${entry.network}: tracing ${candidates.size} ${incremental ? "new" : "historical"} tx(s) for native legs`);
     // Held in an object so the closure's write is visible to the checks around it.
     const blocked: { message: string | null } = { message: null };
+    let done = 0;
     const perTransaction = await mapWithConcurrency([...candidates], TRACE_CONCURRENCY, async ([hash, timestamp]) => {
       // A capability failure applies to the whole chain, so the remaining candidates are skipped
       // rather than each re-learning the same thing at one wasted request apiece.
@@ -436,6 +496,8 @@ export class AlchemyAdapter implements ChainIndexer {
         blocked.message = error.message;
         return [];
       }
+      done += 1;
+      onTrace?.(done, candidates.size);
       return extractNativeTransfers(root, wallet).map<AlchemyTransfer>((movement) => ({
         // Mirrors Alchemy's own `${hash}:internal:${n}` uniqueId shape, so the storage key stays
         // `${chainId}:${txHash}:internal:${n}`. `n` is the frame path, a pure function of the trace
@@ -485,18 +547,34 @@ export class AlchemyAdapter implements ChainIndexer {
     wallet: string,
     candidates: ReadonlyMap<string, string>,
     incremental: boolean,
+    onTrace?: (done: number, total: number) => void,
   ): Promise<AlchemyTransfer[] | null> {
     this.logger.debug(
       `${entry.network}: balance-diffing ${candidates.size} ${incremental ? "new" : "historical"} tx(s) for native legs`,
     );
     try {
-      const withReceipts = await mapWithConcurrency([...candidates], BALANCE_DIFF_CONCURRENCY, async ([hash, timestamp]) => {
-        const receipt = parseReceiptFacts(await this.nativeRpcRead(entry, url, "eth_getTransactionReceipt", [hash]));
+      // Two passes, so progress counts receipts first and legs second. Until pass one is done the
+      // survivor count is unknown, so the total assumes every candidate survives and shrinks once known.
+      let done = 0;
+      // Candidates whose reads the provider refuses for THAT block (ArchiveDepthError) drop out here, one by
+      // one, instead of withholding the chain: their native leg stays unknown, everything else proceeds.
+      let beyondArchive = 0;
+      const withReceipts = (await mapWithConcurrency([...candidates], BALANCE_DIFF_CONCURRENCY, async ([hash, timestamp]) => {
+        let receipt: ReceiptFacts | null;
+        try {
+          receipt = parseReceiptFacts(await this.nativeRpcRead(entry, url, "eth_getTransactionReceipt", [hash]));
+        } catch (error) {
+          if (!(error instanceof ArchiveDepthError)) throw error;
+          beyondArchive += 1;
+          return null;
+        }
         // A null or unreadable receipt for a transaction the Transfers API just reported is an
         // inconsistency, not an empty answer: hold the chain rather than infer from half of it.
         if (receipt === null) throw new ChainIncompleteError(`${entry.network} unusable receipt for ${hash}`);
+        done += 1;
+        onTrace?.(done, candidates.size * 2);
         return { hash, timestamp, receipt };
-      });
+      })).filter((candidate): candidate is { hash: string; timestamp: string; receipt: ReceiptFacts } => candidate !== null);
 
       // A reverted transaction rolled back every state change; only its fee moved.
       const succeeded = withReceipts.filter((candidate) => candidate.receipt.succeeded);
@@ -507,9 +585,22 @@ export class AlchemyAdapter implements ChainIndexer {
         );
       }
 
-      const legs = await mapWithConcurrency(usable, BALANCE_DIFF_CONCURRENCY, async (candidate) =>
-        this.recoverBalanceDiffLeg(entry, url, wallet, candidate),
-      );
+      const legs = await mapWithConcurrency(usable, BALANCE_DIFF_CONCURRENCY, async (candidate) => {
+        let leg: AlchemyTransfer | null;
+        try {
+          leg = await this.recoverBalanceDiffLeg(entry, url, wallet, candidate);
+        } catch (error) {
+          if (!(error instanceof ArchiveDepthError)) throw error;
+          beyondArchive += 1;
+          leg = null;
+        }
+        done += 1;
+        onTrace?.(done, candidates.size + usable.length);
+        return leg;
+      });
+      if (beyondArchive > 0) {
+        this.logger.warn(`${entry.network}: balance-diff skipped ${beyondArchive} candidate(s) whose state the provider does not serve at their block (beyond this key's archive depth); their native legs stay unknown.`);
+      }
       return legs.filter((leg): leg is AlchemyTransfer => leg !== null);
     } catch (error) {
       if (!(error instanceof NativeSourceUnavailableError)) throw error; // transient -> chain withheld
@@ -594,6 +685,9 @@ export class AlchemyAdapter implements ChainIndexer {
     const rpcError = body?.error;
     if (rpcError && isTraceCapabilityError(rpcError.code, rpcError.message)) {
       throw new NativeSourceUnavailableError(asString(rpcError.message) ?? `code ${String(rpcError.code)}`);
+    }
+    if (response.status === 503 && rpcError && Number(rpcError.code) === ARCHIVE_DEPTH_RPC_CODE) {
+      throw new ArchiveDepthError(`${entry.network} ${method}: ${asString(rpcError.message) ?? "unable to complete request"} (HTTP 503, ${ARCHIVE_DEPTH_RPC_CODE})`);
     }
     if (!response.ok) throw new ChainIncompleteError(`${entry.network} ${method} HTTP ${response.status}`);
     if (rpcError) throw new ChainIncompleteError(`${entry.network} ${method} RPC error: ${asString(rpcError.message) ?? "unknown"}`);

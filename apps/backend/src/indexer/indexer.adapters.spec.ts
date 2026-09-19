@@ -125,7 +125,14 @@ function makeFetch(
     if (body.method === "eth_getBalance") {
       const [account, tag] = body.params;
       calls.push({ network, direction: "balance", method: body.method, params: { account, tag } });
-      if (balanceFailure) return failed(balanceFailure);
+      // A declared balance failure applies to the reads of ITS transaction (block - 1 and block), so one
+      // archive-gated candidate can sit next to a healthy one. A state without a block keeps the old
+      // "every balance read fails" behaviour.
+      const gated = Object.values(states).find(
+        (state) => state.balanceFailure && (typeof state.block !== "number" || tag === `0x${state.block.toString(16)}` || tag === `0x${(state.block - 1).toString(16)}`),
+      );
+      if (gated?.balanceFailure) return failed(gated.balanceFailure);
+      if (balanceFailure && Object.values(states).every((state) => typeof state.block !== "number")) return failed(balanceFailure);
       return { ok: true, status: 200, json: async () => ({ result: balanceAt(tag) }) };
     }
     if (body.method === "debug_traceTransaction") {
@@ -1026,6 +1033,32 @@ describe("AlchemyAdapter bounded parallel fan-out", () => {
     expect(peak).toBeLessThanOrEqual(3);
   });
 
+  it("retries a bare 503 (gateway hiccup) but not a 503 that carries a JSON-RPC error (the provider answered)", async () => {
+    for (const [name, withBody, expectedAttempts, chainPresent] of [
+      ["bare", false, 2, true],
+      ["json-rpc error", true, 1, false],
+    ] as const) {
+      const attempts: Record<string, number> = {};
+      vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
+        const body = JSON.parse(init.body);
+        if (body.method === "eth_blockNumber") return { ok: true, status: 200, json: async () => ({ result: "0xf4240" }) };
+        const network = /https:\/\/([^.]+)\.g\.alchemy\.com/.exec(url)?.[1] ?? "";
+        const key = `${network}:${body.params[0].toAddress ? "in" : "out"}`;
+        attempts[key] = (attempts[key] ?? 0) + 1;
+        if (key === "eth-mainnet:in" && attempts[key] === 1) {
+          const envelope = withBody ? { error: { code: -32001, message: "Unable to complete request at this time." } } : {};
+          return { ok: false, status: 503, headers: { get: () => null }, clone: () => ({ json: async () => envelope }), json: async () => envelope };
+        }
+        const transfers = key === "eth-mainnet:in" ? [nativeIn("0x" + "a".repeat(64))] : [];
+        return { ok: true, status: 200, json: async () => ({ result: { transfers } }) };
+      }));
+      const out = await new AlchemyAdapter(makeConfig({ ALCHEMY_API_KEY: "key", ALCHEMY_RETRY_BASE_MS: "1" })).fetchTransactions(WALLET);
+      expect(attempts["eth-mainnet:in"], name).toBe(expectedAttempts);
+      expect(out.chainHeads[1] !== undefined, name).toBe(chainPresent);
+      vi.unstubAllGlobals();
+    }
+  });
+
   it("retries a 429 with backoff and succeeds when the limiter clears", async () => {
     const attempts: Record<string, number> = {};
     vi.stubGlobal("fetch", vi.fn(async (url: string, init: any) => {
@@ -1895,6 +1928,34 @@ describe("AlchemyAdapter native-value recovery by balance diff (free-tier fallba
       expect(arb).toHaveLength(1);
       expect(arb[0].payload.asset_type).toBe("ERC20");
       expect(log.degradations("native balance-diff unavailable")).toHaveLength(1);
+    } finally {
+      log.restore();
+    }
+  });
+
+  it("skips only the candidate whose block is beyond the archive depth (HTTP 503, -32001) and keeps the chain and the other legs", async () => {
+    // Alchemy's Arbitrum endpoint refuses `eth_getBalance` at blocks older than the key's archive depth with a
+    // deterministic 503/-32001 while recent blocks answer fine. Withholding the chain re-walked it from genesis on
+    // every sync only to hit the same wall; gating the whole source would drop the recent legs too.
+    const old = "0x" + "c1".repeat(32);
+    const recent = "0x" + "c2".repeat(32);
+    const log = logs();
+    try {
+      const { transactions, chainHeads } = await runTraced(
+        { "arb-mainnet:out": [{ transfers: [swapOut(old, 4), swapOut(recent, 5)] }] },
+        tierBlocked(old, recent),
+        [],
+        {
+          [old]: { block: 100_000, from: WALLET, to: ROUTER, value: "0x0", gasUsed: "0x2", effectiveGasPrice: "0x3", balanceFailure: { httpStatus: 503, code: -32001, message: "Unable to complete request at this time." } },
+          [recent]: { block: 300_000, from: WALLET, to: ROUTER, value: "0x0", gasUsed: "0x2", effectiveGasPrice: "0x3", before: "0x64", after: "0x3e8" },
+        },
+      );
+      expect(chainHeads[42161]).toBeDefined(); // the chain is complete, not withheld
+      const arb = transactions.filter((t) => t.payload.chain_id === 42161);
+      expect(arb.filter((t) => t.payload.asset_type === "ERC20")).toHaveLength(2); // both USDC disposals kept
+      expect(arb.filter((t) => t.payload.asset_type === "NATIVE").map((t) => t.payload.tx_hash)).toEqual([recent]); // only the recent leg is recovered
+      // The source itself is alive: it is not mistaken for a plan gate and switched off for hours.
+      expect(log.degradations("native balance-diff unavailable")).toHaveLength(0);
     } finally {
       log.restore();
     }

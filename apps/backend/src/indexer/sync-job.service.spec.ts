@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { WalletRepository } from "../wallet/wallet.repository";
 import type { IndexerService, SyncResult } from "./indexer.service";
 import { InMemorySyncJobStore, type SyncDispatcher } from "./sync-job";
-import { SyncJobRunner, SyncJobService, toSyncJobError } from "./sync-job.service";
+import { SyncJobRunner, SyncJobService, toSyncJobDto, toSyncJobError } from "./sync-job.service";
 
 const result: SyncResult = { bindings: 1, fetched: 0, normalized: 0, chains: [], skipped: [] };
 const walletsWith = (count: number) => ({ findAllByUser: vi.fn().mockResolvedValue(Array.from({ length: count }, (_, i) => ({ id: `b${i}` }))) }) as unknown as WalletRepository;
@@ -79,6 +79,23 @@ describe("SyncJobRunner.run", () => {
     const indexer = { sync: vi.fn().mockRejectedValue(new ServiceUnavailableException("Sync failed for all 1 wallet(s).")) } as unknown as IndexerService;
     await expect(new SyncJobRunner(indexer, store).run(job.id, "u1")).resolves.toBeUndefined();
     expect(store.get(job.id)).toMatchObject({ status: "failed", error: { code: "sync_unavailable", message: "Sync failed for all 1 wallet(s)." } });
+  });
+
+  it("forwards progress snapshots into the job record while the sync runs, and the DTO carries them", async () => {
+    const store = new InMemorySyncJobStore();
+    const job = store.create("u1");
+    const progress = { bindings: [{ bindingId: "b1", walletAddress: "0xW1", chains: [{ chainId: 1, phase: "fetching" as const, fetched: 3, saved: 0 }] }], updatedAt: "2026-09-19T00:00:00.000Z" };
+    const seenDuringRun: unknown[] = [];
+    const indexer = {
+      sync: vi.fn(async (_userId: string, options?: { onProgress?: (p: typeof progress) => void }) => {
+        options?.onProgress?.(progress);
+        seenDuringRun.push(store.get(job.id)?.progress);
+        return result;
+      }),
+    } as unknown as IndexerService;
+    await new SyncJobRunner(indexer, store).run(job.id, "u1");
+    expect(seenDuringRun).toEqual([progress]);
+    expect(toSyncJobDto(store.get(job.id)!)).toMatchObject({ status: "done", result, progress });
   });
 
   it("ignores a job the store no longer knows (queue survived a restart, record did not)", async () => {

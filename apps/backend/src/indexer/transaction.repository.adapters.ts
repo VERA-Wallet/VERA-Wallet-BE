@@ -118,13 +118,15 @@ const purgeResult = (plan: SupersededPurgePlan, logger: Logger, bindingId: strin
 
 /** Postgres bind-parameter budget for the `txHash IN (...)` lookup of a heavy full resync. */
 const PURGE_LOOKUP_CHUNK = 1_000;
+/** 저장 진척을 알리는 묶음 크기. */
+const SAVE_PROGRESS_EVERY = 50;
 
 @Injectable()
 export class MockTransactionRepository implements TransactionRepository, TransactionSyncRepository {
   private static readonly logger = new Logger(MockTransactionRepository.name);
   private readonly transactions = new Map<string, TransactionRecord>();
   private readonly bindingOwners = new Map<string, string>();
-  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]) {
+  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void) {
     this.bindingOwners.set(bindingId, userId);
     const stored: TransactionRecord[] = [];
     for (const item of sourceItems) {
@@ -138,6 +140,7 @@ export class MockTransactionRepository implements TransactionRepository, Transac
       this.transactions.set(value.id, value);
       stored.push(value);
     }
+    onSaved?.(stored.length);
     return stored;
   }
   async deleteSupersededRows(bindingId: string, _userId: string, emitted: EmittedLeg[]) {
@@ -158,7 +161,7 @@ export class MockTransactionRepository implements TransactionRepository, Transac
 export class PrismaTransactionRepository implements TransactionRepository, TransactionSyncRepository {
   private static readonly logger = new Logger(PrismaTransactionRepository.name);
   constructor(private readonly prisma: PrismaService) {}
-  async save(bindingId: string, _userId: string, sourceItems: IndexedTransaction[]) {
+  async save(bindingId: string, _userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void) {
     await this.prisma.$transaction(sourceItems.map((item) => this.prisma.transactionRaw.create({ data: { source: item.source, payload: item.payload as Prisma.InputJsonValue } })));
     const result: TransactionRecord[] = [];
     for (const item of sourceItems) {
@@ -176,6 +179,8 @@ export class PrismaTransactionRepository implements TransactionRepository, Trans
         });
       });
       result.push({ ...value, payload: value.payload as Record<string, unknown> });
+      // 행마다 알리면 만 단위 지갑에서 보고가 저장만큼 잦아진다 — 묶음마다, 그리고 마지막에 알린다.
+      if (onSaved && (result.length % SAVE_PROGRESS_EVERY === 0 || result.length === sourceItems.length)) onSaved(result.length);
     }
     return result;
   }
@@ -273,8 +278,8 @@ export class CachedTransactionRepository implements TransactionRepository, Trans
     return updated;
   }
 
-  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]): Promise<TransactionRecord[]> {
-    const stored = await this.inner.save(bindingId, userId, sourceItems);
+  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void): Promise<TransactionRecord[]> {
+    const stored = await this.inner.save(bindingId, userId, sourceItems, onSaved);
     this.invalidate(userId);
     return stored;
   }

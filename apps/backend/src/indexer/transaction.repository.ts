@@ -21,7 +21,8 @@ export interface TransactionRepository {
   updatePayload(userId: string, id: string, payload: Record<string, unknown>): Promise<TransactionRecord | null>;
 }
 export interface TransactionSyncRepository {
-  save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]): Promise<TransactionRecord[]>;
+  /** `onSaved`는 저장한 행 수를 중간중간 알린다 — 만 단위 행을 저장하는 동안 화면이 멈춘 것처럼 보이지 않게. */
+  save(bindingId: string, userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void): Promise<TransactionRecord[]>;
   /**
    * Converge a re-sync: drop the rows this normalization no longer produces for the legs it DID
    * re-emit. Keyed strictly on `emitted` — never on a block range — so a partial fetch (a chain that

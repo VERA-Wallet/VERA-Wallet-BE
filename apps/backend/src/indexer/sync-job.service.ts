@@ -4,6 +4,7 @@ import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import { IndexerService } from "./indexer.service";
 import { SYNC_DISPATCHER, SYNC_JOB_STORE } from "./indexer.tokens";
 import type { SyncDispatcher, SyncJobError, SyncJobRecord, SyncJobStore } from "./sync-job";
+import type { SyncProgress } from "./sync-progress";
 
 const sanitize = (message: unknown): string =>
   typeof message === "string" && message.length > 0 ? message.slice(0, 200) : "Sync failed.";
@@ -36,7 +37,16 @@ export class SyncJobRunner {
     }
     this.store.update(jobId, { status: "running" });
     try {
-      const result = await this.indexer.sync(userId);
+      const result = await this.indexer.sync(userId, {
+        onProgress: (progress) => {
+          // 저장소가 그새 잊은 작업(TTL·용량 정리)이면 받을 주체가 없다. 진척 보고가 동기화를 죽여선 안 된다.
+          try {
+            this.store.update(jobId, { progress });
+          } catch {
+            /* 받을 레코드가 없다 — 동기화는 계속된다 */
+          }
+        },
+      });
       this.store.update(jobId, { status: "done", result });
     } catch (error) {
       const failure = toSyncJobError(error);
@@ -90,6 +100,7 @@ export type SyncJobDto = {
   updatedAt: string;
   result?: SyncJobRecord["result"];
   error?: SyncJobError;
+  progress?: SyncProgress;
 };
 
 export function toSyncJobDto(job: SyncJobRecord): SyncJobDto {
@@ -100,5 +111,6 @@ export function toSyncJobDto(job: SyncJobRecord): SyncJobDto {
     updatedAt: job.updatedAt.toISOString(),
     ...(job.result === undefined ? {} : { result: job.result }),
     ...(job.error === undefined ? {} : { error: job.error }),
+    ...(job.progress === undefined ? {} : { progress: job.progress }),
   };
 }
