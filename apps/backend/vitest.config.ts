@@ -13,6 +13,7 @@ export default defineConfig({
       "@vera/tax-engine": fileURLToPath(new URL("../../packages/tax-engine/src/index.ts", import.meta.url)),
     },
   },
-  // 테스트는 mock 여정을 전제한다. 개발자의 로컬 .env(MOCK_MODE=false 등)에 흔들리지 않게 고정한다.
-  test: { environment: "node", globals: true, hookTimeout: 20_000, testTimeout: 20_000, env: { MOCK_MODE: "true" } },
+  // 테스트는 mock 여정을 전제한다. 개발자의 로컬 .env(MOCK_MODE=false, IDENTITY_PROVIDER=omnione_cx, PERSISTENCE=prisma 등)에
+  // 흔들리지 않게 세 스위치를 전부 고정한다 — dotenv는 이미 있는 값을 덮지 않으므로 여기 값이 이긴다.
+  test: { environment: "node", globals: true, hookTimeout: 20_000, testTimeout: 20_000, env: { MOCK_MODE: "true", IDENTITY_PROVIDER: "mock", PERSISTENCE: "memory" } },
 });
