@@ -34,14 +34,14 @@ describe("architecture boundaries", () => {
 
   it("keeps shared infrastructure independent from feature modules", () => {
     const offenders = filesBelow(join(sourceRoot, "shared"))
-      .filter((path) => /from\s+["']\.\.\/(auth|wallet|indexer|anchor|tax|report|identity)\//.test(readFileSync(path, "utf8")));
+      .filter((path) => /from\s+["']\.\.\/(auth|wallet|indexer|anchor|tax|report|identity|evidence)\//.test(readFileSync(path, "utf8")));
     expect(offenders).toEqual([]);
   });
 
   it("prevents feature modules from importing another feature's concrete services", () => {
-    const features = ["auth", "wallet", "indexer", "anchor", "tax", "report", "identity"];
+    const features = ["auth", "wallet", "indexer", "anchor", "tax", "report", "identity", "evidence"];
     const offenders = features.flatMap((feature) => filesBelow(join(sourceRoot, feature))
-      .filter((path) => new RegExp(`from\\s+["']\\.\\.\\/(?!${feature}\/)(auth|wallet|indexer|anchor|tax|report|identity)\/[^"']+\\.service["']`).test(readFileSync(path, "utf8"))));
+      .filter((path) => new RegExp(`from\\s+["']\\.\\.\\/(?!${feature}\/)(auth|wallet|indexer|anchor|tax|report|identity|evidence)\/[^"']+\\.service["']`).test(readFileSync(path, "utf8"))));
     expect(offenders).toEqual([]);
   });
 

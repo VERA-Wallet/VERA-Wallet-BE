@@ -1,21 +1,27 @@
 import { Injectable, ServiceUnavailableException } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
-import type { AnchorReceipt, AnchorType, EvidenceAnchor } from "@vera/interfaces";
-import { createPublicClient, createWalletClient, encodeAbiParameters, http, keccak256, toBytes, type Chain } from "viem";
+import type { AnchorInspection, AnchorReceipt, AnchorType, EvidenceAnchor } from "@vera/interfaces";
+import { createPublicClient, createWalletClient, encodeAbiParameters, http, keccak256, toBytes, toFunctionSelector, type Chain, type Hex } from "viem";
 import { defineChain } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 import { redactError } from "../shared/redact";
 
 @Injectable()
 export class MockAnchorAdapter implements EvidenceAnchor {
-  private readonly records = new Set<string>();
+  // 해시만 세던 것을 "무엇을 올렸는지"까지 기억하게 바꾼다 — inspect가 실어댑터와 같은 답을 내야 한다.
+  private readonly records = new Map<string, { payloadHash: string; blockNumber: bigint }>();
   private block = 1n;
   async anchor(payloadHash: string, type: AnchorType): Promise<AnchorReceipt> {
     const txHash = keccak256(toBytes(`${payloadHash}:${type}:${this.block}`));
-    this.records.add(txHash);
-    return { txHash, blockNumber: this.block++, anchoredAt: new Date() };
+    const blockNumber = this.block++;
+    this.records.set(txHash, { payloadHash, blockNumber });
+    return { txHash, blockNumber, anchoredAt: new Date() };
   }
   async verify(txHash: string) { return this.records.has(txHash); }
+  async inspect(txHash: string): Promise<AnchorInspection | null> {
+    const record = this.records.get(txHash);
+    return record ? { txHash, blockNumber: record.blockNumber, success: true, anchoredPayloadHash: record.payloadHash } : null;
+  }
 }
 
 /**
@@ -34,18 +40,32 @@ export function rpcAuthHeaders(apiKey?: string): Record<string, string> {
   return token ? { Authorization: `Bearer ${token}` } : {};
 }
 
+const ANCHOR_SELECTOR = toFunctionSelector("anchor(bytes32,string)");
+
+/**
+ * calldata에서 payload 해시를 꺼낸다. 두 경로를 모두 읽는다:
+ * - 컨트랙트 호출(`ANCHOR_CONTRACT_ADDRESS` 설정): 4바이트 셀렉터 다음의 bytes32
+ * - 자기 주소 전송(주소 미설정): calldata 맨 앞의 bytes32
+ * 셀렉터 검사가 먼저다 — 맨 앞 32바이트만 보면 컨트랙트 호출에서는 셀렉터가 섞인 엉뚱한 값을 읽는다.
+ */
+export function payloadHashFromInput(input: Hex): Hex | null {
+  if (input.startsWith(ANCHOR_SELECTOR) && input.length >= 74) return `0x${input.slice(10, 74)}`;
+  if (!input.startsWith(ANCHOR_SELECTOR) && input.length >= 66) return `0x${input.slice(2, 66)}`;
+  return null;
+}
+
 const ANCHOR_CONTRACT_ABI = [{ type: "function", name: "anchor", stateMutability: "nonpayable", inputs: [{ name: "payloadHash", type: "bytes32" }, { name: "anchorType", type: "string" }], outputs: [] }] as const;
 
 @Injectable()
 export class OmniOneChainAdapter implements EvidenceAnchor {
   constructor(private readonly config: ConfigService) {}
+
   private chain(): Chain {
     return defineChain({ id: Number(this.config.get("OMNIONE_CHAIN_ID", "201210")), name: "OmniOne Chain", nativeCurrency: { name: "Gasless", symbol: "GAS", decimals: 18 }, rpcUrls: { default: { http: [this.config.get("OMNIONE_RPC_URL", "https://stage-chainapi.omnione.net")] } } });
   }
   private transport(chain: Chain) {
     return http(chain.rpcUrls.default.http[0], { fetchOptions: { headers: rpcAuthHeaders(this.config.get<string>("OMNIONE_API_KEY")) } });
   }
-
   /**
    * 체인 호출은 전부 이 래퍼를 지난다. RPC 인증 토큰이 **URL 쿼리**에 실려 있어(`?token=<JWT>`)
    * viem의 실패 메시지에 그대로 딸려 나오기 때문이다 — 로그에도 응답에도 평문으로 남으면 안 된다.
@@ -57,7 +77,6 @@ export class OmniOneChainAdapter implements EvidenceAnchor {
       throw redactError(error);
     }
   }
-
 
   async anchor(payloadHash: string, type: AnchorType): Promise<AnchorReceipt> {
     const rawKey = this.config.get<string>("ANCHOR_PRIVATE_KEY");
@@ -76,6 +95,26 @@ export class OmniOneChainAdapter implements EvidenceAnchor {
     if (receipt.status !== "success") throw new ServiceUnavailableException(`OmniOne Chain anchor transaction reverted: ${txHash}`);
     return { txHash: receipt.transactionHash, blockNumber: receipt.blockNumber, anchoredAt: new Date() };
   }
+  async inspect(txHash: string): Promise<AnchorInspection | null> {
+    const chain = this.chain();
+    const client = createPublicClient({ chain, transport: this.transport(chain) });
+    try {
+      const hash = txHash as `0x${string}`;
+      const [transaction, receipt] = await this.guarded(() =>
+        Promise.all([client.getTransaction({ hash }), client.getTransactionReceipt({ hash })]),
+      );
+      return {
+        txHash: receipt.transactionHash,
+        blockNumber: receipt.blockNumber,
+        success: receipt.status === "success",
+        anchoredPayloadHash: payloadHashFromInput(transaction.input),
+      };
+    } catch {
+      // 체인을 못 읽는 것과 "없다"는 다르지만, 화면은 둘 다 "확인하지 못했다"로 말한다.
+      return null;
+    }
+  }
+
   async verify(txHash: string): Promise<boolean> {
     const chain = this.chain();
     const client = createPublicClient({ chain, transport: this.transport(chain) });

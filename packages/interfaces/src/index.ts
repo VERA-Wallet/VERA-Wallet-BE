@@ -21,6 +21,23 @@ export type AnchorType = "binding" | "rule_version" | "audit";
 export interface EvidenceAnchor {
   anchor(payloadHash: string, type: AnchorType): Promise<AnchorReceipt>;
   verify(txHash: string): Promise<boolean>;
+  /**
+   * 체인에서 트랜잭션을 직접 읽어 **무엇이 올라갔는지** 돌려준다.
+   *
+   * `verify`는 "성공했나"만 답한다. 그것만으로는 "내 계산 근거가 올라갔나"를 확인할 수 없다 —
+   * 트랜잭션이 성공해도 다른 해시가 실려 있을 수 있기 때문이다. 이 체인에는 블록 탐색기가 없어
+   * 사용자가 직접 대조할 방법이 없으므로, 서버가 원문을 읽어 와 대조해 준다.
+   */
+  inspect(txHash: string): Promise<AnchorInspection | null>;
+}
+
+/** 체인에 실제로 실려 있는 내용. */
+export interface AnchorInspection {
+  txHash: string;
+  blockNumber: bigint;
+  success: boolean;
+  /** 트랜잭션이 실어 나른 payload 해시. calldata를 읽지 못하면 null. */
+  anchoredPayloadHash: string | null;
 }
 
 export interface AnchorReceipt {
