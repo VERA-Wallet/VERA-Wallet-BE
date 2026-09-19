@@ -12,6 +12,8 @@ class CountingAnchor implements EvidenceAnchor {
     return { txHash: `0x${String(this.calls).padStart(64, "0")}`, blockNumber: BigInt(100 + this.calls), anchoredAt: new Date() };
   }
   async verify() { return true; }
+  /** 이 더미는 조회 대상이 아니다 — 멱등성 테스트는 anchor 호출 횟수만 본다. */
+  async inspect() { return null; }
 }
 
 const HASH = `0x${"ab".repeat(32)}`;
