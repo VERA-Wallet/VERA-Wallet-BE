@@ -11,8 +11,16 @@ import type { ConfigService } from "@nestjs/config";
  * 알 수 없는 값도 기존 동작으로 떨어뜨린다. 오타 하나로 실모드가 조용히 mock 신원을 받아들이면 안 되기 때문이다.
  */
 export function useMockIdentity(config: ConfigService): boolean {
-  const explicit = config.get<string>("IDENTITY_PROVIDER");
-  if (explicit === "mock") return true;
-  if (explicit === "omnione_cx") return false;
-  return config.get<string>("MOCK_MODE", "true") === "true";
+  return identityProviderName((key) => config.get<string>(key)) === "mock";
+}
+
+/**
+ * 어느 신원 공급자로 도는지의 이름. /health가 이 값을 내보내 FE가 로그인 화면의 출처 배지를 정확히 그린다 —
+ * FE는 자기 CX mock 스위치만 알지, BE가 토큰을 실제로 검증하는지는 여기서만 알 수 있다.
+ */
+export function identityProviderName(get: (key: string) => string | undefined): "mock" | "omnione_cx" {
+  const explicit = get("IDENTITY_PROVIDER");
+  if (explicit === "mock") return "mock";
+  if (explicit === "omnione_cx") return "omnione_cx";
+  return (get("MOCK_MODE") ?? "true") === "true" ? "mock" : "omnione_cx";
 }
