@@ -1,6 +1,6 @@
 import type { ConfigService } from "@nestjs/config";
 import { describe, expect, it } from "vitest";
-import { useMockIdentity } from "./identity-mode";
+import { identityProviderName, useMockIdentity } from "./identity-mode";
 
 const configOf = (values: Record<string, string | undefined>) =>
   ({ get: (key: string, fallback?: string) => values[key] ?? fallback }) as unknown as ConfigService;
@@ -24,8 +24,6 @@ describe("useMockIdentity", () => {
     expect(useMockIdentity(configOf({ MOCK_MODE: "false", IDENTITY_PROVIDER: "mokc" }))).toBe(false);
   });
 });
-import { describe, expect, it } from "vitest";
-import { identityProviderName } from "./identity-mode";
 
 describe("identityProviderName — /health가 내보내는 신원 공급자 이름", () => {
   const env = (values: Record<string, string | undefined>) => (key: string) => values[key];
