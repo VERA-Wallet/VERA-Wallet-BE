@@ -3,9 +3,12 @@ import { ConfigService } from "@nestjs/config";
 import { CHAIN_REGISTRY, type ChainRegistryEntry } from "../indexer/chain-registry";
 import type { BalanceReader, BalanceSnapshot, ChainBalances, TokenBalance, TokenMetadata } from "./balance-reader";
 
-// Same bounded fan-out as the indexer adapter (indexer.adapters.ts CHAIN_CONCURRENCY): the compute-unit
-// budget is shared across every network host on one key.
-const CHAIN_CONCURRENCY = 3;
+// Per-chain fan-out. The indexer keeps three chains in flight (indexer.adapters.ts CHAIN_CONCURRENCY) because
+// `alchemy_getAssetTransfers` costs 150 CU and a 5-chain burst tops the shared 330 CUPS budget. A balance read is
+// far cheaper: `eth_getBalance` 19 CU + `alchemy_getTokenBalances` 26 CU per chain, about 225 CU for all five at once,
+// so every chain goes together: a user is waiting on this GET, and three at a time meant two round trips per wallet
+// (2026-09-20: 3.6s for two wallets at 0.3–1.0s per Alchemy call). A 429 is still retried below (rpcPost).
+const CHAIN_CONCURRENCY = 5;
 // `alchemy_getTokenBalances` pages at 100 contracts. A wallet with >2,000 distinct ERC20s is spam-bombed;
 // past this point the rest is dropped and the chain is reported as truncated in the log, not withheld.
 const MAX_TOKEN_PAGES = 20;
@@ -97,8 +100,8 @@ export class AlchemyBalanceReader implements BalanceReader {
     const outcomes = await mapWithConcurrency<ChainRegistryEntry, Outcome>(CHAIN_REGISTRY, CHAIN_CONCURRENCY, async (entry) => {
       try {
         const url = this.urlFor(entry, apiKey);
-        const nativeRaw = await this.fetchNativeBalance(entry, url, wallet);
-        const { tokens, truncated } = await this.fetchTokenBalances(entry, url, wallet);
+        // The two reads are independent; serialising them added a full round trip per chain.
+        const [nativeRaw, { tokens, truncated }] = await Promise.all([this.fetchNativeBalance(entry, url, wallet), this.fetchTokenBalances(entry, url, wallet)]);
         return { entry, balances: { chainId: entry.chainId, nativeRaw, tokens }, truncated };
       } catch (error) {
         return { entry, error: error as Error };
