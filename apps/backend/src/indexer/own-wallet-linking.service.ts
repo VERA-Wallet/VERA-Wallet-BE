@@ -3,6 +3,7 @@ import type { TransactionRecord } from "../shared/repository.types";
 import type { WalletRepository } from "../wallet/wallet.repository";
 import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import { TRANSACTION_REPOSITORY } from "./indexer.tokens";
+import type { OwnWalletUnlinkPort } from "./own-wallet-unlink.port";
 import type { TransactionRepository } from "./transaction.repository";
 
 // Namespace for the pairing key this pass writes into `bridge_group_id`. Bridge linking writes
@@ -64,7 +65,7 @@ const assetKeyOf = (payload: Record<string, unknown>): string => {
  * that actually differs is written.
  */
 @Injectable()
-export class OwnWalletLinkingService {
+export class OwnWalletLinkingService implements OwnWalletUnlinkPort {
   private readonly logger = new Logger(OwnWalletLinkingService.name);
 
   constructor(
@@ -110,6 +111,38 @@ export class OwnWalletLinkingService {
         } catch (error) {
           this.logger.warn(`own-wallet link write failed for ${leg.id}: ${(error as Error).message}`);
         }
+      }
+    }
+    return changed;
+  }
+
+  /**
+   * 지갑 등록 해제 뒤 정리. 지운 지갑과 주고받은 이동은 더 이상 "내 지갑 간 이동"을 증명할 바인딩이 없으므로
+   * 일반 전송(OUT→SEND, IN→RECEIVE)으로 되돌리고 짝 키를 뗀다 — "바인딩만이 증명"이라는 위 규칙을 해제 뒤에도 같게
+   * 지키는 것이다. linkForUser는 지금 바인딩된 쌍만 보므로 이 되돌림은 스스로 하지 못한다.
+   *
+   * 사용자 수정 행은 건드리지 않고, 브릿지 패스가 쓴 `bridge:` 키도 건드리지 않는다(그건 다른 증명이다).
+   * confidence는 그대로 둔다 — 외부 주소로의 전송이라는 판정은 이동이라는 판정만큼 확실하다. 되돌린 행 수를 돌려준다.
+   */
+  async unlinkCounterparty(userId: string, removedAddress: string): Promise<number> {
+    const removed = lower(removedAddress);
+    if (removed === null) return 0;
+    const all = await this.transactions.listForUser(userId);
+    let changed = 0;
+    for (const leg of all) {
+      const p = leg.payload;
+      if (p.user_override != null) continue;
+      if (p.classification !== "INTERNAL_TRANSFER") continue;
+      if (lower(p.counterparty) !== removed) continue;
+      const group = p.bridge_group_id ?? null;
+      // 이 패스가 쓴 행만: 짝 키가 `own:`이거나(양쪽 다 있었던 이동) 없거나(한쪽만 있었던 이동).
+      if (group !== null && !isOwnTransferGroup(group)) continue;
+      const classification = p.direction === "OUT" ? "SEND" : p.direction === "IN" ? "RECEIVE" : "UNKNOWN";
+      try {
+        await this.transactions.updatePayload(userId, leg.id, { ...p, classification, bridge_group_id: null, bridge_dest_chain_id: null });
+        changed += 1;
+      } catch (error) {
+        this.logger.warn(`own-wallet unlink write failed for ${leg.id}: ${(error as Error).message}`);
       }
     }
     return changed;
