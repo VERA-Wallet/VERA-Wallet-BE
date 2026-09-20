@@ -152,6 +152,12 @@ export class MockTransactionRepository implements TransactionRepository, Transac
     for (const id of plan.deleteIds) this.transactions.delete(id);
     return purgeResult(plan, MockTransactionRepository.logger, bindingId);
   }
+  async deleteAllForBinding(bindingId: string, _userId: string) {
+    const ids = [...this.transactions.values()].filter((row) => row.bindingId === bindingId).map((row) => row.id);
+    for (const id of ids) this.transactions.delete(id);
+    this.bindingOwners.delete(bindingId);
+    return ids.length;
+  }
   async listForUser(userId: string) { return [...this.transactions.values()].filter((item) => this.bindingOwners.get(item.bindingId) === userId).sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime()); }
   async findForUser(userId: string, id: string) { return (await this.listForUser(userId)).find((tx) => tx.id === id || tx.payload.id === id) ?? null; }
   async updatePayload(userId: string, id: string, payload: Record<string, unknown>) { const existing = await this.findForUser(userId, id); if (!existing) return null; existing.payload = payload; return existing; }
@@ -219,6 +225,17 @@ export class PrismaTransactionRepository implements TransactionRepository, Trans
       ]);
     }
     return purgeResult(plan, PrismaTransactionRepository.logger, bindingId);
+  }
+  async deleteAllForBinding(bindingId: string, _userId: string) {
+    // deleteSupersededRows와 같은 규칙: TaxEvent는 FK만 있고 cascade가 없어 먼저 지운다. 이미 보고서에 실린
+    // 건이 있으면 그 보고서의 합계가 낡는다 — 여기서 결정하지 않고 크게 알린다.
+    const filed = await this.prisma.taxEvent.count({ where: { tx: { bindingId }, reportId: { not: null } } });
+    if (filed > 0) PrismaTransactionRepository.logger.warn(`binding ${bindingId}: unbinding removes ${filed} tax event(s) already filed into a report; report totals are now stale.`);
+    const [, removed] = await this.prisma.$transaction([
+      this.prisma.taxEvent.deleteMany({ where: { tx: { bindingId } } }),
+      this.prisma.transactionNormalized.deleteMany({ where: { bindingId } }),
+    ]);
+    return removed.count;
   }
   async listForUser(userId: string) { const values = await this.prisma.transactionNormalized.findMany({ where: { binding: { userId } }, orderBy: { occurredAt: "asc" } }); return values.map((value) => ({ ...value, payload: value.payload as Record<string, unknown> })); }
   async findForUser(userId: string, id: string) { return (await this.listForUser(userId)).find((tx) => tx.id === id || tx.payload.id === id) ?? null; }
@@ -288,6 +305,12 @@ export class CachedTransactionRepository implements TransactionRepository, Trans
     const result = await this.inner.deleteSupersededRows(bindingId, userId, emitted);
     this.invalidate(userId);
     return result;
+  }
+
+  async deleteAllForBinding(bindingId: string, userId: string): Promise<number> {
+    const removed = await this.inner.deleteAllForBinding(bindingId, userId);
+    this.invalidate(userId);
+    return removed;
   }
 
   invalidate(userId?: string): void {

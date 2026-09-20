@@ -26,6 +26,10 @@ export class MockSyncCursorRepository implements SyncCursorRepository {
     existing.lastSyncedBlock = head > existing.lastSyncedBlock ? head : existing.lastSyncedBlock;
     existing.rulesVersion = Math.max(existing.rulesVersion, rulesVersion);
   }
+
+  async deleteForBinding(bindingId: string): Promise<void> {
+    for (const key of [...this.cursors.keys()]) if (key.startsWith(`${bindingId}:`)) this.cursors.delete(key);
+  }
 }
 
 @Injectable()
@@ -49,5 +53,9 @@ export class PrismaSyncCursorRepository implements SyncCursorRepository {
         "rulesVersion" = GREATEST("BindingChainCursor"."rulesVersion", EXCLUDED."rulesVersion"),
         "lastSyncedAt" = EXCLUDED."lastSyncedAt"
     `;
+  }
+
+  async deleteForBinding(bindingId: string): Promise<void> {
+    await this.prisma.bindingChainCursor.deleteMany({ where: { bindingId } });
   }
 }

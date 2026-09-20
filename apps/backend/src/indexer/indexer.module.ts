@@ -28,7 +28,7 @@ import { OwnWalletLinkingService } from "./own-wallet-linking.service";
 import { InMemorySyncJobStore } from "./sync-job";
 import { SyncJobRunner, SyncJobService } from "./sync-job.service";
 import { BullSyncDispatcher, InProcessSyncDispatcher, SyncProcessor } from "./sync.queue";
-import { CHAIN_INDEXER, COST_BASIS_SNAPSHOT, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
+import { CHAIN_INDEXER, COST_BASIS_SNAPSHOT, HISTORICAL_PRICE_ORACLE, HISTORICAL_PRICE_REPOSITORY, OWN_WALLET_UNLINK, PRICE_ORACLE, SYNC_CURSOR_REPOSITORY, SYNC_DISPATCHER, SYNC_JOB_STORE, TRANSACTION_AVAILABILITY, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
 
 // anchor.module.ts와 같은 스위치: Redis(Bull)는 MOCK_MODE=false에서만 있다.
 const mock = process.env.MOCK_MODE !== "false";
@@ -77,6 +77,8 @@ const mock = process.env.MOCK_MODE !== "false";
     HistoricalPriceEnrichmentService,
     BridgeLinkingService,
     OwnWalletLinkingService,
+    // 지갑 등록 해제가 쓰는 포트. 구체 서비스를 다른 기능에 내보내지 않는다(아키텍처 경계).
+    { provide: OWN_WALLET_UNLINK, useExisting: OwnWalletLinkingService },
     IndexerService,
     InMemorySyncJobStore,
     { provide: SYNC_JOB_STORE, useExisting: InMemorySyncJobStore },
@@ -94,6 +96,6 @@ const mock = process.env.MOCK_MODE !== "false";
     EventReclassificationService,
     AnchorProofService,
   ],
-  exports: [IndexerService, TransactionService, TRANSACTION_REPOSITORY, TRANSACTION_AVAILABILITY, COST_BASIS_SNAPSHOT, PRICE_ORACLE],
+  exports: [IndexerService, TransactionService, OWN_WALLET_UNLINK, TRANSACTION_REPOSITORY, TRANSACTION_SYNC_REPOSITORY, SYNC_CURSOR_REPOSITORY, TRANSACTION_AVAILABILITY, COST_BASIS_SNAPSHOT, PRICE_ORACLE],
 })
 export class IndexerModule {}

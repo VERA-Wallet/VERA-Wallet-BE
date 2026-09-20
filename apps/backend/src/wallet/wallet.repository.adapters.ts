@@ -19,6 +19,7 @@ export class MockWalletRepository implements WalletBindingRepository, WalletRepo
   async findLatestByUser(userId: string) { return [...this.bindings.values()].reverse().find((item) => item.userId === userId) ?? null; }
   async findAllByUser(userId: string) { return [...this.bindings.values()].filter((item) => item.userId === userId).sort((a, b) => a.boundAt.getTime() - b.boundAt.getTime()); }
   async markInitialSynced(bindingId: string, at: Date) { const value = this.bindings.get(bindingId); if (value) value.initialSyncedAt = at; }
+  async delete(bindingId: string) { this.bindings.delete(bindingId); }
 }
 
 @Injectable()
@@ -34,4 +35,5 @@ export class PrismaWalletRepository implements WalletBindingRepository, WalletRe
   findLatestByUser(userId: string) { return this.prisma.walletBinding.findFirst({ where: { userId }, orderBy: { boundAt: "desc" } }); }
   findAllByUser(userId: string) { return this.prisma.walletBinding.findMany({ where: { userId }, orderBy: { boundAt: "asc" } }); }
   async markInitialSynced(bindingId: string, at: Date) { await this.prisma.walletBinding.update({ where: { id: bindingId }, data: { initialSyncedAt: at } }); }
+  async delete(bindingId: string) { await this.prisma.walletBinding.delete({ where: { id: bindingId } }); }
 }
