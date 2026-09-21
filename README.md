@@ -2,6 +2,18 @@
 
 VERA Wallet의 NestJS 백엔드입니다. 서버는 개인키를 생성하거나 저장하지 않으며, 지갑 소유권은 5분짜리 challenge와 `personal_sign`/SIWE 서명으로만 검증합니다. 사용자 식별 정보와 지갑 주소는 PostgreSQL에만 저장되고 OmniOne Chain에는 `binding`, `rule_version`, `audit` 해시만 전달됩니다. `AnchorRecord`에는 의도적으로 사용자 FK가 없습니다.
 
+## 배포하는 브랜치는 `main` 하나다
+
+공개 배포(https://verawallet.pelicanlab.dev)의 Docker 이미지는 **체크아웃된 소스 그대로** 빌드된다.
+feature 브랜치를 체크아웃한 채 루트 런처에서 `pnpm docker:up`을 하면 아직 리뷰도 병합도 되지 않은 코드가
+공개 주소에 올라간다. 빌드 전에 이 저장소를 `main`으로(FE는 `master`로) 돌리고 `git status`가 빈 것을 확인한다.
+내 변경을 배포에 넣는 길은 브랜치를 띄우는 것이 아니라 **PR을 `main`에 병합한 뒤 다시 빌드하는 것**이다.
+
+```bash
+git switch main && git pull
+git status --short   # 비어 있어야 한다
+```
+
 ## 구성
 
 - `apps/backend`: NestJS API, Prisma/PostgreSQL, Bull/Redis 어댑터
