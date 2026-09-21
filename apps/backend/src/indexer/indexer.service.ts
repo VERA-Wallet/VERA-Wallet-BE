@@ -1,5 +1,5 @@
-import { Inject, Injectable, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
-import type { ChainIndexer } from "@vera/interfaces";
+import { Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
+import type { ChainIndexer, ChainScanHooks, ChainScanOutcome } from "@vera/interfaces";
 import { keccak256, toBytes } from "viem";
 import type { AnchorQueryPort, AnchorSubmissionPort } from "../anchor/anchor.port";
 import { ANCHOR_QUERY, ANCHOR_SUBMISSION } from "../anchor/anchor.tokens";
@@ -7,6 +7,8 @@ import type { BindingRecord, TransactionRecord } from "../shared/repository.type
 import type { WalletRepository } from "../wallet/wallet.repository";
 import { WALLET_REPOSITORY } from "../wallet/wallet.tokens";
 import { SUPPORTED_CHAIN_IDS } from "./chain-registry";
+import { NORMALIZATION_RULES_VERSION } from "./normalization-rules";
+import { SyncProgressTracker, type SyncProgress } from "./sync-progress";
 import type { SyncCursorRepository } from "./sync-cursor.repository";
 import type { TransactionSyncRepository } from "./transaction.repository";
 import { CHAIN_INDEXER, SYNC_CURSOR_REPOSITORY, TRANSACTION_SYNC_REPOSITORY } from "./indexer.tokens";
@@ -16,17 +18,20 @@ import { BridgeLinkingService } from "./bridge-linking.service";
 import { OwnWalletLinkingService } from "./own-wallet-linking.service";
 
 type SyncMode = "subset" | "all";
+type SyncTotals = { fetched: number; normalized: number; byChain: Map<number, number> };
 type SkipEntry = { bindingId: string; chainId?: number; code: string; message?: string };
 // Per-chain fetched counts across the whole run (all bindings). Always covers every supported
 // chain (0 allowed) so the FE import modal can render the full scan list from one response.
 export type ChainFetchCount = { chainId: number; fetched: number };
 export type SyncResult = { bindings: number; fetched: number; normalized: number; chains: ChainFetchCount[]; skipped: SkipEntry[] };
+export type SyncOptions = { onProgress?: (progress: SyncProgress) => void };
 
 const sanitize = (message: unknown): string | undefined =>
   typeof message === "string" && message.length > 0 ? message.slice(0, 200) : undefined;
 
 @Injectable()
 export class IndexerService {
+  private readonly logger = new Logger(IndexerService.name);
   // Per-user promise coalescer. Each entry is tagged with its work-set mode so a forced
   // all-binding refresh is never satisfied by an in-flight subset bootstrap.
   private readonly inflight = new Map<string, { mode: SyncMode; promise: Promise<SyncResult> }>();
@@ -44,11 +49,19 @@ export class IndexerService {
     private readonly ownWalletLinking: OwnWalletLinkingService,
   ) {}
 
-  /** Forced incremental refresh across ALL bindings (manual resync + legacy /indexer/sync). */
-  async sync(userId: string): Promise<SyncResult> {
+  /**
+   * Forced incremental refresh across ALL bindings (manual resync + legacy /indexer/sync).
+   * `onProgress` receives (binding, chain) snapshots while the run is in flight; a call that rides an
+   * already in-flight run (see `coalesce`) shares its result but not its progress stream.
+   */
+  async sync(userId: string, options: SyncOptions = {}): Promise<SyncResult> {
     const bindings = await this.wallets.findAllByUser(userId);
     if (bindings.length === 0) throw new NotFoundException("A bound wallet is required before sync.");
-    return this.coalesce(userId, "all", () => this.runSync(userId, bindings));
+    // A wallet that has never been synced is the one the user is waiting on (the import modal opens right
+    // after binding it). Walk those first so a long-standing big wallet does not keep it queued for minutes.
+    // Stable sort: the repository's order is kept within each group.
+    const ordered = [...bindings].sort((a, b) => Number(a.initialSyncedAt !== null) - Number(b.initialSyncedAt !== null));
+    return this.coalesce(userId, "all", () => this.runSync(userId, ordered, options.onProgress));
   }
 
   /**
@@ -135,85 +148,76 @@ export class IndexerService {
     };
   }
 
-  private async runSync(userId: string, bindings: BindingRecord[]): Promise<SyncResult> {
+  private async runSync(userId: string, bindings: BindingRecord[], onProgress?: (progress: SyncProgress) => void): Promise<SyncResult> {
     const skipped: SkipEntry[] = [];
-    const fetchedByChain = new Map<number, number>();
-    let fetched = 0;
-    let normalized = 0;
+    const totals: SyncTotals = { fetched: 0, normalized: 0, byChain: new Map<number, number>() };
     let allFailed = true;
+    // Progress is reported per (binding, chain). Registering every pair up front lets a viewer count
+    // "n of m" and keeps bindings whose turn has not come from vanishing off the list.
+    const progress = new SyncProgressTracker(bindings, SUPPORTED_CHAIN_IDS, onProgress);
 
     for (const binding of bindings) {
       try {
         const cursors = await this.cursors.listForBinding(binding.id);
         const sinceByChain: Record<number, bigint> = {};
-        for (const cursor of cursors) sinceByChain[cursor.chainId] = cursor.lastSyncedBlock;
-
-        const { transactions, chainHeads } = await this.indexer.fetchTransactions(binding.walletAddress, sinceByChain);
-        fetched += transactions.length;
-        for (const item of transactions) {
-          const chainId = Number(item.chain);
-          fetchedByChain.set(chainId, (fetchedByChain.get(chainId) ?? 0) + 1);
+        const rewalk: number[] = [];
+        for (const cursor of cursors) {
+          // A cursor walked under older normalization rules is stale evidence, not progress: its rows carry
+          // judgments the current rules would not make (a forged "EТH" send indexed before the forgery rule
+          // stayed SEND). Leaving the chain out of `sinceByChain` walks it from genesis again; the
+          // edit-preserving upsert and the superseded-row purge in persistChain turn that into corrections
+          // rather than duplicates. See normalization-rules.ts.
+          if (cursor.rulesVersion < NORMALIZATION_RULES_VERSION) {
+            rewalk.push(cursor.chainId);
+            continue;
+          }
+          sinceByChain[cursor.chainId] = cursor.lastSyncedBlock;
+        }
+        if (rewalk.length > 0) {
+          this.logger.log(`binding ${binding.id}: re-walking chain(s) ${rewalk.join(", ")} from genesis — cursor rules version is behind ${NORMALIZATION_RULES_VERSION}.`);
         }
 
-        // Best-effort market enrichment (DexScreener): dust gate + informational price.
-        // A pricing failure must NEVER fail the binding sync, so it is fully guarded.
-        try {
-          await this.pricing.enrich(transactions);
-        } catch (error) {
-          skipped.push({ bindingId: binding.id, code: "price_enrichment_failed", message: sanitize((error as Error).message) });
-        }
+        // Each chain is persisted the moment the adapter hands it over (streaming), so a big wallet shows
+        // its finished chains while the slow ones are still being scanned. Persistence is serialized on
+        // one queue: three chains can finish at once, but DB round-trips do not interleave and one chain's
+        // failure never drags another down. The adapter is not made to wait for the queue.
+        const persisted = new Set<number>();
+        let queue: Promise<void> = Promise.resolve();
+        const hooks: ChainScanHooks = {
+          onProgress: (update) => progress.chain(binding.id, update.chainId).scanning(update),
+          onChainError: (chainId, message) => progress.chain(binding.id, chainId).fail(message),
+          onChain: (outcome) => {
+            persisted.add(outcome.chainId);
+            queue = queue.then(() => this.persistChain(userId, binding, outcome, progress, skipped, totals));
+          },
+        };
+        const { transactions, chainHeads } = await this.indexer.fetchTransactions(binding.walletAddress, sinceByChain, hooks);
+        await queue;
 
-        // Tax-basis enrichment (CoinGecko historical KRW): fills fiat_value/price_status the
-        // real adapter leaves null. Distinct concern from the display-only spot price above,
-        // and equally guarded — a basis lookup failure must never fail the binding sync.
-        try {
-          await this.historicalPricing.enrich(transactions);
-        } catch (error) {
-          skipped.push({ bindingId: binding.id, code: "historical_price_enrichment_failed", message: sanitize((error as Error).message) });
-        }
-
-        const withHashes = transactions.map((item) => ({
-          ...item,
-          payload: { ...item.payload, _anchorPayloadHash: keccak256(toBytes(JSON.stringify({ txHash: item.txHash, eventType: item.eventType, payload: item.payload }))) },
-        }));
-        const stored = await this.transactions.save(binding.id, userId, withHashes);
-        normalized += stored.length;
-
-        // Re-normalization can move a leg to another eventType (UNKNOWN transfer_out -> EXCHANGE swap)
-        // or fold it into a neighbouring leg's row (netted_leg_ids). The storage key is
-        // (binding, txHash, eventType), so the upsert above writes the NEW row and leaves the old one
-        // behind — the FE then shows the corrected event AND a ghost 미분류 row next to it. This purge
-        // is keyed ONLY on legs that were positively re-emitted just now, never on a block range, so a
-        // partial fetch can never wipe real history. Guarded: it must not fail an otherwise-good sync.
-        try {
-          await this.transactions.deleteSupersededRows(binding.id, userId, stored.map((row) => ({
-            id: row.txHash,
-            eventType: row.eventType,
-            nettedLegIds: Array.isArray(row.payload.netted_leg_ids) ? row.payload.netted_leg_ids.map(String) : [],
-          })));
-        } catch (error) {
-          skipped.push({ bindingId: binding.id, code: "superseded_purge_failed", message: sanitize((error as Error).message) });
-        }
-
-        // Advance cursors ONLY for completely-observed chains; hold + report the rest.
+        // Non-streaming adapters (mock, test fakes) only return the aggregate: persist whatever was not
+        // handed over above through the very same routine. A chain without a head was not completely
+        // observed — hold its cursor and report it.
         for (const chainId of SUPPORTED_CHAIN_IDS) {
+          if (persisted.has(chainId)) continue;
           const head = chainHeads[chainId];
-          if (head === undefined) skipped.push({ bindingId: binding.id, chainId, code: "chain_incomplete" });
-          else await this.cursors.advance(binding.id, chainId, BigInt(head));
+          if (head === undefined) {
+            skipped.push({ bindingId: binding.id, chainId, code: "chain_incomplete" });
+            progress.chain(binding.id, chainId).fail("chain incomplete");
+            continue;
+          }
+          await this.persistChain(userId, binding, { chainId, head, transactions: transactions.filter((item) => Number(item.chain) === chainId) }, progress, skipped, totals);
         }
-
-        // Anchor submission is reserved for verified (siwe) bindings; watch-only rows
-        // are still fetched/normalized/stored, just never anchored.
-        if (binding.verifiedAt !== null) await this.anchorStored(stored, skipped, binding.id);
 
         // Mark the first attempt done ONLY when currently null, so a manual ALL resync preserves the
         // original first-attempt timestamp (null-gating still drives the read path either way).
         if (binding.initialSyncedAt === null) await this.wallets.markInitialSynced(binding.id, new Date());
-        // The binding fully completed (fetch + persist + cursor + marker) -> the run is not a total failure.
+        // At least one chain was observed (fetchTransactions throws otherwise) -> the run is not a total failure.
         allFailed = false;
       } catch (error) {
         // Binding-level failure: hold its cursors + marker, record a diagnostic, keep other bindings going.
-        skipped.push({ bindingId: binding.id, code: "binding_unavailable", message: sanitize((error as Error).message) });
+        const message = sanitize((error as Error).message);
+        skipped.push({ bindingId: binding.id, code: "binding_unavailable", message });
+        for (const chainId of SUPPORTED_CHAIN_IDS) progress.chain(binding.id, chainId).fail(message ?? "binding unavailable");
       }
     }
 
@@ -235,11 +239,86 @@ export class IndexerService {
 
     return {
       bindings: bindings.length,
-      fetched,
-      normalized,
-      chains: SUPPORTED_CHAIN_IDS.map((chainId) => ({ chainId, fetched: fetchedByChain.get(chainId) ?? 0 })),
+      fetched: totals.fetched,
+      normalized: totals.normalized,
+      chains: SUPPORTED_CHAIN_IDS.map((chainId) => ({ chainId, fetched: totals.byChain.get(chainId) ?? 0 })),
       skipped,
     };
+  }
+
+  /**
+   * One chain of one binding, from enrichment to cursor: price, save (edit-preserving upsert), purge the
+   * rows this normalization superseded, advance the cursor, anchor. Runs the same whether the chain was
+   * streamed by the adapter or taken from the aggregate result, so both paths produce identical rows.
+   * A failure anywhere leaves the cursor where it was — the next sync sees the same window again.
+   */
+  private async persistChain(
+    userId: string,
+    binding: BindingRecord,
+    outcome: ChainScanOutcome,
+    progress: SyncProgressTracker,
+    skipped: SkipEntry[],
+    totals: SyncTotals,
+  ): Promise<void> {
+    const { chainId, head, transactions } = outcome;
+    const chain = progress.chain(binding.id, chainId);
+    totals.fetched += transactions.length;
+    totals.byChain.set(chainId, (totals.byChain.get(chainId) ?? 0) + transactions.length);
+    try {
+      chain.pricing(transactions.length);
+      // Best-effort market enrichment (DexScreener): dust gate + informational price.
+      // A pricing failure must NEVER fail the chain, so it is fully guarded.
+      try {
+        await this.pricing.enrich(transactions);
+      } catch (error) {
+        skipped.push({ bindingId: binding.id, code: "price_enrichment_failed", message: sanitize((error as Error).message) });
+      }
+
+      // Tax-basis enrichment (CoinGecko historical KRW): fills fiat_value/price_status the
+      // real adapter leaves null. Distinct concern from the display-only spot price above,
+      // and equally guarded — a basis lookup failure must never fail the chain.
+      try {
+        await this.historicalPricing.enrich(transactions);
+      } catch (error) {
+        skipped.push({ bindingId: binding.id, code: "historical_price_enrichment_failed", message: sanitize((error as Error).message) });
+      }
+
+      chain.saving(0);
+      const withHashes = transactions.map((item) => ({
+        ...item,
+        payload: { ...item.payload, _anchorPayloadHash: keccak256(toBytes(JSON.stringify({ txHash: item.txHash, eventType: item.eventType, payload: item.payload }))) },
+      }));
+      const stored = await this.transactions.save(binding.id, userId, withHashes, (saved) => chain.saving(saved));
+      totals.normalized += stored.length;
+
+      // Re-normalization can move a leg to another eventType (UNKNOWN transfer_out -> EXCHANGE swap)
+      // or fold it into a neighbouring leg's row (netted_leg_ids). The storage key is
+      // (binding, txHash, eventType), so the upsert above writes the NEW row and leaves the old one
+      // behind — the FE then shows the corrected event AND a ghost 미분류 row next to it. This purge
+      // is keyed ONLY on legs that were positively re-emitted just now, never on a block range, so a
+      // partial fetch can never wipe real history. Guarded: it must not fail an otherwise-good chain.
+      try {
+        await this.transactions.deleteSupersededRows(binding.id, userId, stored.map((row) => ({
+          id: row.txHash,
+          eventType: row.eventType,
+          nettedLegIds: Array.isArray(row.payload.netted_leg_ids) ? row.payload.netted_leg_ids.map(String) : [],
+        })));
+      } catch (error) {
+        skipped.push({ bindingId: binding.id, code: "superseded_purge_failed", message: sanitize((error as Error).message) });
+      }
+
+      // The chain was completely observed up to `head` and its rows are stored: advance its cursor.
+      await this.cursors.advance(binding.id, chainId, BigInt(head), NORMALIZATION_RULES_VERSION);
+
+      // Anchor submission is reserved for verified (siwe) bindings; watch-only rows
+      // are still fetched/normalized/stored, just never anchored.
+      if (binding.verifiedAt !== null) await this.anchorStored(stored, skipped, binding.id);
+      chain.done(stored.length);
+    } catch (error) {
+      const message = sanitize((error as Error).message);
+      skipped.push({ bindingId: binding.id, chainId, code: "chain_incomplete", message });
+      chain.fail(message ?? "chain persist failed");
+    }
   }
 
   // Per-event anchor guard, isolated: a rejection for one event never stops another. On enqueue

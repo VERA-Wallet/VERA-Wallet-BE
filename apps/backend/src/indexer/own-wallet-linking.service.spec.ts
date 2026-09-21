@@ -293,3 +293,40 @@ describe("OwnWalletLinkingService.linkForUser", () => {
     expect((await byDirection(base, "IN")).payload.bridge_group_id).toBe(`own:1:${TX}:7`);
   });
 });
+
+describe("OwnWalletLinkingService.unlinkCounterparty", () => {
+  // 지갑 B를 등록 해제한 뒤: A에 남은 "B와의 이동" 판정은 증명(바인딩)을 잃었으니 일반 전송으로 돌아가야 한다.
+  const afterRemovingB = () => seed([
+    { wallet: WALLET_A, legs: [
+      // 양쪽이 있었던 이동(짝 키 own:) — B의 행은 바인딩과 함께 이미 지워졌다.
+      leg({ id: "out", wallet: WALLET_A, counterparty: WALLET_B, dir: "OUT", cls: "INTERNAL_TRANSFER", bridgeGroupId: `own:1:${TX}:7`, destChainId: null }),
+      // 한쪽만 있었던 이동(짝 키 없음).
+      leg({ id: "in-onesided", wallet: WALLET_A, counterparty: WALLET_B, dir: "IN", cls: "INTERNAL_TRANSFER", bridgeGroupId: null, logIndex: 8 }),
+      // 사용자가 직접 고친 행은 그대로.
+      leg({ id: "edited", wallet: WALLET_A, counterparty: WALLET_B, dir: "OUT", cls: "INTERNAL_TRANSFER", bridgeGroupId: `own:1:${TX}:9`, logIndex: 9, userOverride: { classification: "INTERNAL_TRANSFER" } }),
+      // 제3자와의 거래는 무관.
+      leg({ id: "third", wallet: WALLET_A, counterparty: STRANGER, dir: "OUT", cls: "INTERNAL_TRANSFER", bridgeGroupId: `own:1:${TX}:10`, logIndex: 10 }),
+      // 브릿지 패스가 쓴 짝 키는 다른 증명이다 — 건드리지 않는다.
+      leg({ id: "bridge", wallet: WALLET_A, counterparty: WALLET_B, dir: "OUT", cls: "INTERNAL_TRANSFER", bridgeGroupId: "bridge:1:x", destChainId: 42161, logIndex: 11 }),
+    ] },
+  ], [WALLET_A]);
+
+  it("re-judges the remaining wallet's moves with the removed wallet as plain transfers, leaving edits, third parties and bridges alone", async () => {
+    const { repo, service } = await afterRemovingB();
+
+    expect(await service.unlinkCounterparty(USER, WALLET_B.toUpperCase().replace("0X", "0x"))).toBe(2);
+
+    const byId = Object.fromEntries((await rows(repo)).map((row) => [String(row.payload.id), row.payload]));
+    expect(byId.out).toMatchObject({ classification: "SEND", bridge_group_id: null, bridge_dest_chain_id: null, confidence: 0.9 });
+    expect(byId["in-onesided"]).toMatchObject({ classification: "RECEIVE", bridge_group_id: null });
+    expect(byId.edited).toMatchObject({ classification: "INTERNAL_TRANSFER", bridge_group_id: `own:1:${TX}:9` });
+    expect(byId.third).toMatchObject({ classification: "INTERNAL_TRANSFER", bridge_group_id: `own:1:${TX}:10` });
+    expect(byId.bridge).toMatchObject({ classification: "INTERNAL_TRANSFER", bridge_group_id: "bridge:1:x", bridge_dest_chain_id: 42161 });
+  });
+
+  it("is idempotent: a second pass finds nothing left to revert", async () => {
+    const { service } = await afterRemovingB();
+    await service.unlinkCounterparty(USER, WALLET_B);
+    expect(await service.unlinkCounterparty(USER, WALLET_B)).toBe(0);
+  });
+});

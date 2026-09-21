@@ -1,0 +1,23 @@
+# 빌드 컨텍스트에서 뺀다. .env*는 자격증명이라 절대 이미지에 들어가면 안 된다(compose가 env_file로 주입).
+node_modules
+**/node_modules
+**/dist
+**/*.tsbuildinfo
+.env
+.env.*
+**/.env
+**/.env.*
+!**/.env.example
+**/coverage
+artifacts
+docs
+apps/backend/test
+apps/backend/contracts
+apps/backend/prisma/dev.db
+.git
+.gjc
+.omc
+*.log
+.DS_Store
+Dockerfile
+docker-compose.yml

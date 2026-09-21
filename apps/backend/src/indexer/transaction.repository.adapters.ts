@@ -118,13 +118,15 @@ const purgeResult = (plan: SupersededPurgePlan, logger: Logger, bindingId: strin
 
 /** Postgres bind-parameter budget for the `txHash IN (...)` lookup of a heavy full resync. */
 const PURGE_LOOKUP_CHUNK = 1_000;
+/** 저장 진척을 알리는 묶음 크기. */
+const SAVE_PROGRESS_EVERY = 50;
 
 @Injectable()
 export class MockTransactionRepository implements TransactionRepository, TransactionSyncRepository {
   private static readonly logger = new Logger(MockTransactionRepository.name);
   private readonly transactions = new Map<string, TransactionRecord>();
   private readonly bindingOwners = new Map<string, string>();
-  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]) {
+  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void) {
     this.bindingOwners.set(bindingId, userId);
     const stored: TransactionRecord[] = [];
     for (const item of sourceItems) {
@@ -138,6 +140,7 @@ export class MockTransactionRepository implements TransactionRepository, Transac
       this.transactions.set(value.id, value);
       stored.push(value);
     }
+    onSaved?.(stored.length);
     return stored;
   }
   async deleteSupersededRows(bindingId: string, _userId: string, emitted: EmittedLeg[]) {
@@ -149,6 +152,12 @@ export class MockTransactionRepository implements TransactionRepository, Transac
     for (const id of plan.deleteIds) this.transactions.delete(id);
     return purgeResult(plan, MockTransactionRepository.logger, bindingId);
   }
+  async deleteAllForBinding(bindingId: string, _userId: string) {
+    const ids = [...this.transactions.values()].filter((row) => row.bindingId === bindingId).map((row) => row.id);
+    for (const id of ids) this.transactions.delete(id);
+    this.bindingOwners.delete(bindingId);
+    return ids.length;
+  }
   async listForUser(userId: string) { return [...this.transactions.values()].filter((item) => this.bindingOwners.get(item.bindingId) === userId).sort((a, b) => a.occurredAt.getTime() - b.occurredAt.getTime()); }
   async findForUser(userId: string, id: string) { return (await this.listForUser(userId)).find((tx) => tx.id === id || tx.payload.id === id) ?? null; }
   async updatePayload(userId: string, id: string, payload: Record<string, unknown>) { const existing = await this.findForUser(userId, id); if (!existing) return null; existing.payload = payload; return existing; }
@@ -158,7 +167,7 @@ export class MockTransactionRepository implements TransactionRepository, Transac
 export class PrismaTransactionRepository implements TransactionRepository, TransactionSyncRepository {
   private static readonly logger = new Logger(PrismaTransactionRepository.name);
   constructor(private readonly prisma: PrismaService) {}
-  async save(bindingId: string, _userId: string, sourceItems: IndexedTransaction[]) {
+  async save(bindingId: string, _userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void) {
     await this.prisma.$transaction(sourceItems.map((item) => this.prisma.transactionRaw.create({ data: { source: item.source, payload: item.payload as Prisma.InputJsonValue } })));
     const result: TransactionRecord[] = [];
     for (const item of sourceItems) {
@@ -176,6 +185,8 @@ export class PrismaTransactionRepository implements TransactionRepository, Trans
         });
       });
       result.push({ ...value, payload: value.payload as Record<string, unknown> });
+      // 행마다 알리면 만 단위 지갑에서 보고가 저장만큼 잦아진다 — 묶음마다, 그리고 마지막에 알린다.
+      if (onSaved && (result.length % SAVE_PROGRESS_EVERY === 0 || result.length === sourceItems.length)) onSaved(result.length);
     }
     return result;
   }
@@ -214,6 +225,17 @@ export class PrismaTransactionRepository implements TransactionRepository, Trans
       ]);
     }
     return purgeResult(plan, PrismaTransactionRepository.logger, bindingId);
+  }
+  async deleteAllForBinding(bindingId: string, _userId: string) {
+    // deleteSupersededRows와 같은 규칙: TaxEvent는 FK만 있고 cascade가 없어 먼저 지운다. 이미 보고서에 실린
+    // 건이 있으면 그 보고서의 합계가 낡는다 — 여기서 결정하지 않고 크게 알린다.
+    const filed = await this.prisma.taxEvent.count({ where: { tx: { bindingId }, reportId: { not: null } } });
+    if (filed > 0) PrismaTransactionRepository.logger.warn(`binding ${bindingId}: unbinding removes ${filed} tax event(s) already filed into a report; report totals are now stale.`);
+    const [, removed] = await this.prisma.$transaction([
+      this.prisma.taxEvent.deleteMany({ where: { tx: { bindingId } } }),
+      this.prisma.transactionNormalized.deleteMany({ where: { bindingId } }),
+    ]);
+    return removed.count;
   }
   async listForUser(userId: string) { const values = await this.prisma.transactionNormalized.findMany({ where: { binding: { userId } }, orderBy: { occurredAt: "asc" } }); return values.map((value) => ({ ...value, payload: value.payload as Record<string, unknown> })); }
   async findForUser(userId: string, id: string) { return (await this.listForUser(userId)).find((tx) => tx.id === id || tx.payload.id === id) ?? null; }
@@ -273,8 +295,8 @@ export class CachedTransactionRepository implements TransactionRepository, Trans
     return updated;
   }
 
-  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[]): Promise<TransactionRecord[]> {
-    const stored = await this.inner.save(bindingId, userId, sourceItems);
+  async save(bindingId: string, userId: string, sourceItems: IndexedTransaction[], onSaved?: (saved: number) => void): Promise<TransactionRecord[]> {
+    const stored = await this.inner.save(bindingId, userId, sourceItems, onSaved);
     this.invalidate(userId);
     return stored;
   }
@@ -283,6 +305,12 @@ export class CachedTransactionRepository implements TransactionRepository, Trans
     const result = await this.inner.deleteSupersededRows(bindingId, userId, emitted);
     this.invalidate(userId);
     return result;
+  }
+
+  async deleteAllForBinding(bindingId: string, userId: string): Promise<number> {
+    const removed = await this.inner.deleteAllForBinding(bindingId, userId);
+    this.invalidate(userId);
+    return removed;
   }
 
   invalidate(userId?: string): void {

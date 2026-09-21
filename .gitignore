@@ -13,3 +13,6 @@ apps/backend/prisma/dev.db
 # OMC runtime state (any depth). Project-scoped skills under .omc/skills are the committable exception.
 .omc/
 !.omc/skills/
+
+# .env 백업본(자격증명 포함). 편집 전에 복사해 두는 관례라 저장소에 절대 올리지 않는다.
+**/.env.bak-*

@@ -2,6 +2,7 @@ import { BadRequestException, Injectable, NotFoundException } from "@nestjs/comm
 import { Inject } from "@nestjs/common";
 import type { AnchorQueryPort } from "../anchor/anchor.port";
 import { ANCHOR_QUERY } from "../anchor/anchor.tokens";
+import { omnioneExplorerTxUrl } from "../shared/omnione-explorer";
 import { TransactionService } from "./transaction.service";
 
 @Injectable()
@@ -18,7 +19,8 @@ export class AnchorProofService {
       tx_hash: anchor.chainTxHash,
       merkle_root: payloadHash,
       anchored_at: anchor.anchoredAt.toISOString(),
-      explorer_url: `https://stage-chainapi.omnione.net/tx/${anchor.chainTxHash}`,
+      // 탐색기가 없는 환경에서는 null이다 — 죽은 링크를 주느니 없다고 말한다.
+      explorer_url: omnioneExplorerTxUrl(anchor.chainTxHash),
     };
   }
 }

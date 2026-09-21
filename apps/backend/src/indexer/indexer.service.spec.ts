@@ -1,7 +1,10 @@
 import { ServiceUnavailableException } from "@nestjs/common";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChainIndexer, ChainScanResult, IndexedTransaction } from "@vera/interfaces";
+import type { ChainIndexer, ChainScanHooks, ChainScanResult, IndexedTransaction } from "@vera/interfaces";
+import type { SyncProgress } from "./sync-progress";
+import { SUPPORTED_CHAIN_IDS } from "./chain-registry";
 import { IndexerService } from "./indexer.service";
+import { NORMALIZATION_RULES_VERSION } from "./normalization-rules";
 import { MockTransactionRepository } from "./transaction.repository.adapters";
 import { MockSyncCursorRepository } from "./sync-cursor.repository.adapters";
 import { MockWalletRepository } from "../wallet/wallet.repository.adapters";
@@ -314,8 +317,9 @@ describe("IndexerService gaps (AC7/12/14/15)", () => {
     await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
     const saveSpy = vi.spyOn(h.transactions, "save");
     await Promise.all([h.service.ensureInitialSync("u1"), h.service.ensureInitialSync("u1"), h.service.ensureInitialSync("u1")]);
-    expect(saveSpy).toHaveBeenCalledTimes(1);
-    expect(saveSpy.mock.calls[0][2]).toHaveLength(2);
+    // 저장은 체인마다 한 번이다(스트리밍). 세 번의 동시 읽기가 그 횟수를 곱하지 않아야 한다.
+    expect(saveSpy).toHaveBeenCalledTimes(SUPPORTED_CHAIN_IDS.length);
+    expect(saveSpy.mock.calls.flatMap((call) => call[2])).toHaveLength(2);
   });
 
   it("clears the coalescer after a REJECTED run so a later sync retries (AC7)", async () => {
@@ -363,5 +367,109 @@ describe("IndexerService gaps (AC7/12/14/15)", () => {
     await new Promise((r) => setTimeout(r, 2));
     await h.service.sync("u1"); // forced ALL over an already-synced binding
     expect((await h.wallets.findAllByUser("u1"))[0].initialSyncedAt).toEqual(first);
+  });
+});
+
+describe("IndexerService normalization rules version", () => {
+  it("re-walks a chain whose cursor was written under older rules, then stamps the current version and goes incremental again", async () => {
+    const h = await harness();
+    const binding = await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    // 규칙이 바뀌기 전에 걸어 둔 커서: 1번 체인만 옛 버전이다.
+    for (const chainId of [8453, 42161, 10, 137]) await h.cursors.advance(binding.id, chainId, 80n, NORMALIZATION_RULES_VERSION);
+    await h.cursors.advance(binding.id, 1, 40n, NORMALIZATION_RULES_VERSION - 1);
+
+    await h.service.sync("u1");
+    // 옛 규칙의 체인은 since에서 빠져 처음부터 걷고, 나머지는 평소처럼 증분이다.
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({ 8453: 80n, 42161: 80n, 10: 80n, 137: 80n });
+    expect((await h.cursors.listForBinding(binding.id)).find((c) => c.chainId === 1)).toEqual({ chainId: 1, lastSyncedBlock: 100n, rulesVersion: NORMALIZATION_RULES_VERSION });
+
+    // 한 번 다시 걸었으면 끝이다 — 다음 동기화는 다섯 체인 모두 증분이다.
+    h.indexerFn.mockClear();
+    await h.service.sync("u1");
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({ 1: 100n, 8453: 100n, 42161: 100n, 10: 100n, 137: 100n });
+  });
+
+  it("a never-synced binding still starts from genesis on every chain (no cursors at all)", async () => {
+    const h = await harness();
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1" });
+    await h.service.sync("u1");
+    expect(h.indexerFn.mock.calls[0][1]).toEqual({});
+    expect((await h.cursors.listForBinding((await h.wallets.findAllByUser("u1"))[0].id)).every((c) => c.rulesVersion === NORMALIZATION_RULES_VERSION)).toBe(true);
+  });
+});
+
+
+describe("IndexerService binding order", () => {
+  it("walks never-synced wallets before already-synced ones, keeping repository order within each group", async () => {
+    const order: string[] = [];
+    const h = await harness(async (address) => { order.push(address); return { transactions: [], chainHeads: { ...ALL_HEADS } }; });
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xOLD1", bindingHash: "0xh1" });
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xOLD2", bindingHash: "0xh2" });
+    await h.service.sync("u1"); // 둘 다 한 번 동기화됨
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xNEW", bindingHash: "0xh3" });
+    order.length = 0;
+    await h.service.sync("u1");
+    expect(order).toEqual(["0xNEW", "0xOLD1", "0xOLD2"]);
+  });
+});
+
+describe("IndexerService streaming persistence and progress", () => {
+  const onChain = (i: number, chain: number): IndexedTransaction => ({ ...evt(i), chain: String(chain), payload: { ...evt(i).payload, chain_id: chain } });
+
+  /** 실어댑터처럼 행동하는 가짜: 두 체인은 끝나는 대로 넘기고, 하나는 실패를 알리고, 나머지는 관찰하지 못한다. */
+  const streaming = async (_address: string, _since?: Record<number, bigint>, hooks?: ChainScanHooks): Promise<ChainScanResult> => {
+    hooks?.onProgress?.({ chainId: 1, phase: "fetching", fetched: 2 });
+    hooks?.onProgress?.({ chainId: 1, phase: "tracing", fetched: 2, traced: { done: 1, total: 1 } });
+    await hooks?.onChain?.({ chainId: 1, head: 100, transactions: [onChain(1, 1), onChain(2, 1)] });
+    hooks?.onChainError?.(42161, "arbitrum-mainnet repeated pageKey (incomplete)");
+    await hooks?.onChain?.({ chainId: 8453, head: 100, transactions: [onChain(3, 8453)] });
+    // 집계 결과에도 넘긴 체인이 들어 있다 — 서비스는 이것을 두 번 저장하면 안 된다.
+    return { transactions: [onChain(1, 1), onChain(2, 1), onChain(3, 8453)], chainHeads: { 1: 100, 8453: 100 } };
+  };
+
+  it("persists a chain as soon as the adapter hands it over, advances only that chain's cursor, and never stores it twice", async () => {
+    const h = await harness(streaming);
+    const binding = await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1", verifiedAt: null, verificationMethod: "watch_only" });
+    const result = await h.service.sync("u1");
+    expect((await h.transactions.listForUser("u1")).map((row) => row.txHash).sort()).toEqual(["0xtx1", "0xtx2", "0xtx3"]);
+    expect(result).toMatchObject({ bindings: 1, fetched: 3, normalized: 3 });
+    expect(result.chains).toEqual([1, 8453, 42161, 10, 137].map((chainId) => ({ chainId, fetched: chainId === 1 ? 2 : chainId === 8453 ? 1 : 0 })));
+    const cursors = (await h.cursors.listForBinding(binding.id)).map((c) => c.chainId).sort((a, b) => a - b);
+    expect(cursors).toEqual([1, 8453]);
+    expect(result.skipped.filter((entry) => entry.code === "chain_incomplete").map((entry) => entry.chainId ?? -1).sort((a, b) => a - b)).toEqual([10, 137, 42161]);
+  });
+
+  it("reports (binding, chain) progress through every phase and keeps the adapter's failure reason", async () => {
+    const h = await harness(streaming);
+    await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1", verifiedAt: null, verificationMethod: "watch_only" });
+    const snapshots: SyncProgress[] = [];
+    await h.service.sync("u1", { onProgress: (progress) => snapshots.push(progress) });
+
+    // 첫 스냅샷: 모든 체인이 대기.
+    expect(snapshots[0].bindings[0].chains.map((chain) => chain.phase)).toEqual(["pending", "pending", "pending", "pending", "pending"]);
+    const phasesOf = (chainId: number) => snapshots.map((snapshot) => snapshot.bindings[0].chains.find((chain) => chain.chainId === chainId)!.phase);
+    // 1번 체인은 받는 중 → 추적 → 가격 → 저장 → 완료를 순서대로 지난다.
+    const seen = [...new Set(phasesOf(1))];
+    expect(seen).toEqual(["pending", "fetching", "tracing", "pricing", "saving", "done"]);
+    const last = snapshots[snapshots.length - 1].bindings[0];
+    expect(last.walletAddress).toBe("0xW1");
+    expect(last.chains.find((chain) => chain.chainId === 1)).toEqual({ chainId: 1, phase: "done", fetched: 2, saved: 2, traced: { done: 1, total: 1 } });
+    expect(last.chains.find((chain) => chain.chainId === 42161)).toMatchObject({ phase: "failed", message: "arbitrum-mainnet repeated pageKey (incomplete)" });
+    expect(last.chains.find((chain) => chain.chainId === 10)).toMatchObject({ phase: "failed", message: "chain incomplete" });
+  });
+
+  it("holds the cursor and reports the chain when persisting it fails, without touching the other chains", async () => {
+    const h = await harness(streaming);
+    const binding = await upsertBinding(h.wallets, { userId: "u1", walletAddress: "0xW1", bindingHash: "0xh1", verifiedAt: null, verificationMethod: "watch_only" });
+    const original = h.transactions.save.bind(h.transactions);
+    vi.spyOn(h.transactions, "save").mockImplementation(async (bindingId, userId, items, onSaved) => {
+      if (items.some((item) => item.chain === "8453")) throw new Error("db write failed");
+      return original(bindingId, userId, items, onSaved);
+    });
+    const snapshots: SyncProgress[] = [];
+    const result = await h.service.sync("u1", { onProgress: (progress) => snapshots.push(progress) });
+    expect((await h.cursors.listForBinding(binding.id)).map((c) => c.chainId)).toEqual([1]);
+    expect(result.skipped).toContainEqual({ bindingId: binding.id, chainId: 8453, code: "chain_incomplete", message: "db write failed" });
+    expect(snapshots[snapshots.length - 1].bindings[0].chains.find((chain) => chain.chainId === 8453)).toMatchObject({ phase: "failed", message: "db write failed" });
   });
 });
