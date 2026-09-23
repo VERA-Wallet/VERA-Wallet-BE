@@ -1,7 +1,7 @@
 import type { ConfigService } from "@nestjs/config";
 
 /**
- * 신원 검증 공급자(mock / OmniOne CX)를 고르는 스위치.
+ * 신원 검증 공급자(mock / OmniOne CX / Open DID)를 고르는 스위치.
  *
  * MOCK_MODE와 분리해 둔 이유는 persistence-mode.ts와 같다. 실지갑 인덱싱·시세·앵커를 실모드로 검증하고 싶은데
  * 손에 모바일신분증이 없으면, MOCK_MODE=false인 채로는 로그인 첫 단계에서 막혀 뒤쪽을 아무것도 볼 수 없다.
@@ -18,8 +18,9 @@ export function useMockIdentity(config: ConfigService): boolean {
  * 어느 신원 공급자로 도는지의 이름. /health가 이 값을 내보내 FE가 로그인 화면의 출처 배지를 정확히 그린다 —
  * FE는 자기 CX mock 스위치만 알지, BE가 토큰을 실제로 검증하는지는 여기서만 알 수 있다.
  */
-export function identityProviderName(get: (key: string) => string | undefined): "mock" | "omnione_cx" {
+export function identityProviderName(get: (key: string) => string | undefined): "mock" | "omnione_cx" | "opendid" {
   const explicit = get("IDENTITY_PROVIDER");
+  if (explicit === "opendid") return "opendid";
   if (explicit === "mock") return "mock";
   if (explicit === "omnione_cx") return "omnione_cx";
   return (get("MOCK_MODE") ?? "true") === "true" ? "mock" : "omnione_cx";

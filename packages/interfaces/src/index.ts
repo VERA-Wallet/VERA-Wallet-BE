@@ -1,5 +1,5 @@
 export interface IdentityProvider {
-  requestVerification(sessionId: string): Promise<VerificationRequest>;
+  requestVerification(sessionId: string): Promise<VerificationRequest | OpenDidOffer>;
   handleCallback(token: string): Promise<VerifiedIdentity>;
 }
 
@@ -10,10 +10,18 @@ export interface VerificationRequest {
   expiresAt: Date;
 }
 
+export interface OpenDidOffer {
+  provider: "opendid";
+  sessionId: string;
+  offerId: string;
+  qrPayload: Record<string, unknown>;
+  expiresAt: Date;
+}
+
 export interface VerifiedIdentity {
   didHash: string;
   verifiedAt: Date;
-  method: "omnione_cx" | "mock";
+  method: "omnione_cx" | "mock" | "opendid";
 }
 
 export type AnchorType = "binding" | "rule_version" | "audit";
