@@ -2,9 +2,9 @@ import { ConfigService } from "@nestjs/config";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { OpenDidVerifierAdapter } from "./opendid-verifier.adapter";
 
-const settings = { IDENTITY_PROVIDER: "opendid", OPENDID_VERIFIER_URL: "http://verifier:8092/verifier/", OPENDID_POLICY_ID: "policy", OPENDID_SUBJECT_CLAIM_CODE: "subjectId", OPENDID_TRUSTED_ISSUER_ID: "did:issuer" };
+const settings = { IDENTITY_PROVIDER: "opendid", OPENDID_SUBJECT_BINDINGS: JSON.stringify({ "opaque-person-1": "did:omn:holder" }), OPENDID_VERIFIER_URL: "http://verifier:8092/verifier/", OPENDID_POLICY_ID: "policy", OPENDID_SUBJECT_CLAIM_CODE: "subjectId", OPENDID_TRUSTED_ISSUER_ID: "did:issuer" };
 const claim = { code: "subjectId", value: "opaque-person-1", type: "text", format: "plain", hideValue: false };
-const verified = { result: true, issuer: "did:issuer", claims: [claim] };
+const verified = { holder: "did:omn:holder", result: true, issuer: "did:issuer", claims: [claim] };
 const adapter = (extra = {}) => new OpenDidVerifierAdapter(new ConfigService({ ...settings, ...extra }));
 function reply(body: unknown, status = 200) { const fetch = vi.fn().mockResolvedValue(new Response(JSON.stringify(body), { status })); vi.stubGlobal("fetch", fetch); return fetch; }
 afterEach(() => vi.unstubAllGlobals());
@@ -44,7 +44,7 @@ describe("OpenDidVerifierAdapter", () => {
   it("requires explicit policy trust for upstream servers that omit issuer", async () => {
     expect(() => adapter({ OPENDID_ISSUER_BINDING: "policy" })).toThrow(/CONFIRMED/);
     const a = adapter({ OPENDID_ISSUER_BINDING: "policy", OPENDID_POLICY_ISSUER_RESTRICTION_CONFIRMED: "true" });
-    reply({ result: true, claims: [claim] }); expect(await a.checkVerification("offer")).toMatchObject({ status: "verified" });
+    reply({ result: true, holder: "did:omn:holder", claims: [claim] }); expect(await a.checkVerification("offer")).toMatchObject({ status: "verified" });
     reply({ ...verified, issuer: "did:wrong" }); expect(await a.checkVerification("offer")).toEqual({ status: "rejected" });
   });
   it.each([null, {}, { result: "true", claims: [] }, { result: true }])("fails closed on malformed results: %j", async body => {
@@ -60,5 +60,13 @@ describe("OpenDidVerifierAdapter", () => {
     await expect(adapter().handleCallback("offer")).rejects.toMatchObject({ status: 401 });
     for (const url of ["http://host:8092", "http://host/verifier/verifier", "ftp://host/verifier", "http://host/verifier?secret=x"]) expect(() => adapter({ OPENDID_VERIFIER_URL: url })).toThrow();
     expect(() => adapter({ OPENDID_POLICY_ID: "" })).toThrow();
+  });
+  it("rejects a copied subject issued to another holder", async () => {
+    reply({ ...verified, holder: "did:attacker" });
+    expect(await adapter().checkVerification("offer")).toEqual({ status: "rejected" });
+    reply({ ...verified, holder: undefined });
+    expect(await adapter().checkVerification("offer")).toEqual({ status: "rejected" });
+    reply({ ...verified, claims: [{ ...claim, value: "unregistered" }] });
+    expect(await adapter().checkVerification("offer")).toEqual({ status: "rejected" });
   });
 });

@@ -1,4 +1,4 @@
-import { BadRequestException, Inject, Injectable } from "@nestjs/common";
+import { BadRequestException, ServiceUnavailableException, Inject, Injectable } from "@nestjs/common";
 import type { AnchorQueryPort, AnchorSubmissionPort } from "../anchor/anchor.port";
 import { ANCHOR_QUERY, ANCHOR_SUBMISSION } from "../anchor/anchor.tokens";
 import { omnioneExplorerTxUrl } from "../shared/omnione-explorer";
@@ -70,6 +70,7 @@ export class TaxEvidenceService {
   ) {}
 
   async record(userId: string, dto: RecordEvidenceDto): Promise<EvidenceView> {
+    if (this.anchors.enabled?.() === false) throw new ServiceUnavailableException({ code: "anchoring_disabled", message: "현재 환경에서는 체인 증명 저장이 비활성화되어 있습니다." });
     if (dto.leaves.length > EVIDENCE_MAX_LEAVES) {
       throw new BadRequestException(`Evidence document is too large: ${dto.leaves.length} leaves (max ${EVIDENCE_MAX_LEAVES}).`);
     }

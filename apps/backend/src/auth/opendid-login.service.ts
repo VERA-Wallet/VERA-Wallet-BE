@@ -1,4 +1,4 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { HttpException, Injectable, Logger, OnModuleDestroy, OnModuleInit } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import type { Request, Response } from "express";
@@ -15,6 +15,7 @@ function fail(status: number, code: string): never { throw new HttpException({ c
 @Injectable()
 export class OpenDidLoginService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(OpenDidLoginService.name);
+  private globalBudget = { count: 0, until: 0 };
   private timer?: ReturnType<typeof setInterval>;
   private readonly issuance = new Map<string, { count: number; until: number }>();
   constructor(private readonly config: ConfigService, private readonly verifier: OpenDidVerifierAdapter,
@@ -45,14 +46,21 @@ export class OpenDidLoginService implements OnModuleInit, OnModuleDestroy {
     response.setHeader("Cache-Control", "no-store");
     const now = Date.now();
     for (const [key, row] of this.issuance) if (row.until <= now) this.issuance.delete(key);
-    // Direct peer address only: do not trust attacker-supplied forwarding headers.
-    const key = request.ip ?? request.socket?.remoteAddress ?? "unknown";
+    // A signed browser cookie separates users behind the FE proxy. Never trust forwarded IP headers.
+    const supplied: unknown = request.cookies?.vw_did_client;
+    const sign = (id: string) => createHmac("sha256", this.config.getOrThrow<string>("JWT_SECRET")).update("opendid-client:" + id).digest("hex");
+    const parts = typeof supplied === "string" ? supplied.split(".") : [];
+    const valid = parts.length === 2 && /^[a-f0-9]{32}$/.test(parts[0]) && /^[a-f0-9]{64}$/.test(parts[1]) &&
+      timingSafeEqual(Buffer.from(parts[1], "hex"), Buffer.from(sign(parts[0]), "hex"));
+    const key = valid ? parts[0] : randomBytes(16).toString("hex");
+    if (this.globalBudget.until <= now) this.globalBudget = { count: 0, until: now + 60_000 };
     const budget = this.issuance.get(key) ?? { count: 0, until: now + 60_000 };
-    if (budget.count >= 10 || this.issuance.size >= 10000 && !this.issuance.has(key)) {
-      response.setHeader("Retry-After", String(Math.max(1, Math.ceil((budget.until - now) / 1000))));
+    // Independent global ceiling also bounds callers that discard cookies on every request.
+    if (budget.count >= 10 || this.globalBudget.count >= 100) {
+      response.setHeader("Retry-After", String(Math.max(1, Math.ceil(((budget.count >= 10 ? budget.until : this.globalBudget.until) - now) / 1000))));
       fail(429, "verification_rate_limited");
     }
-    budget.count++; this.issuance.set(key, budget);
+    budget.count++; this.globalBudget.count++; this.issuance.set(key, budget);
     const id = randomUUID();
     const offer = await this.verifier.requestVerification(id);
     const secret = randomBytes(32).toString("hex");
@@ -60,6 +68,7 @@ export class OpenDidLoginService implements OnModuleInit, OnModuleDestroy {
     await this.store.create({ id, offerId: offer.offerId, secretHash: hash(secret), policyId: this.verifier.policyId,
       country, expiresAt: offer.expiresAt, status: "pending", nextPollAt: new Date(), leaseToken: null, leaseUntil: null, consumedAt: null }, previous ? hash(previous) : undefined);
     response.cookie(COOKIE, secret, { ...this.cookieOptions(), maxAge: offer.expiresAt.getTime() - Date.now() });
+    response.cookie("vw_did_client", `${key}.${sign(key)}`, { ...this.cookieOptions(), maxAge: 86_400_000 });
     return { offerId: offer.offerId, qrPayload: offer.qrPayload, expiresAt: offer.expiresAt.toISOString(), pollAfterMs: this.verifier.pollAfterMs };
   }
   async present(offerId: string, country: string, request: Request, response: Response) {

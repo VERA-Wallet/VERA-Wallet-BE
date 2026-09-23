@@ -29,6 +29,16 @@ export class OpenDidVerifierAdapter implements IdentityProvider {
   get ttlMs() { return this.integer("OPENDID_ATTEMPT_TTL_SECONDS", 300, 600) * 1000; }
   get policyId() { return this.required("OPENDID_POLICY_ID"); }
   private get issuerMode() { return this.config.get<string>("OPENDID_ISSUER_BINDING") ?? "response"; }
+  private subjectBindings(): Record<string, string> {
+    let value: unknown;
+    try { value = JSON.parse(this.required("OPENDID_SUBJECT_BINDINGS")); } catch {
+      throw new Error("OPENDID_SUBJECT_BINDINGS must be a server-managed subject-to-holder JSON map.");
+    }
+    if (!object(value) || !Object.keys(value).length || !Object.values(value).every(v => typeof v === "string" && /^did:[a-z0-9]+:.+/.test(v))) {
+      throw new Error("OPENDID_SUBJECT_BINDINGS must contain registered holder DIDs.");
+    }
+    return value as Record<string, string>;
+  }
   private validateConfiguration() {
     const url = new URL(this.required("OPENDID_VERIFIER_URL"));
     if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.search || url.hash || url.pathname.replace(/\/$/, "") !== "/verifier") {
@@ -37,7 +47,7 @@ export class OpenDidVerifierAdapter implements IdentityProvider {
     this.policyId;
     this.required("OPENDID_SUBJECT_CLAIM_CODE");
     this.required("OPENDID_TRUSTED_ISSUER_ID");
-    this.timeoutMs; this.ttlMs;
+    this.timeoutMs; this.ttlMs; this.subjectBindings();
     if (!["response", "policy"].includes(this.issuerMode)) throw new Error("OPENDID_ISSUER_BINDING must be response or policy.");
     if (this.issuerMode === "policy" && this.config.get<string>("OPENDID_POLICY_ISSUER_RESTRICTION_CONFIRMED") !== "true") {
       throw new Error("Policy issuer binding requires OPENDID_POLICY_ISSUER_RESTRICTION_CONFIRMED=true.");
@@ -85,6 +95,8 @@ export class OpenDidVerifierAdapter implements IdentityProvider {
     const code = this.required("OPENDID_SUBJECT_CLAIM_CODE");
     const claims = body.claims.filter(c => object(c) && c.code === code);
     if (claims.length !== 1 || !nonempty(claims[0].value) || claims[0].value.length > 1024 || claims[0].type !== "text" || claims[0].format !== "plain" || claims[0].hideValue !== false) return { status: "rejected" };
+    const bindings = this.subjectBindings();
+    if (!nonempty(body.holder) || !Object.hasOwn(bindings, claims[0].value) || bindings[claims[0].value] !== body.holder) return { status: "rejected" };
     const didHash = `0x${createHash("sha256").update(JSON.stringify(["opendid", "v1", issuer, code, claims[0].value])).digest("hex")}`;
     return { status: "verified", identity: { didHash, verifiedAt: new Date(), method: "opendid" } };
   }

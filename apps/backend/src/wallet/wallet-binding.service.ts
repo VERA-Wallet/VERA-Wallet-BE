@@ -17,7 +17,7 @@ export class WalletBindingService {
     const binding = await this.wallets.upsert({ userId: user.sub, walletAddress: checksumAddress, bindingHash, verificationMethod: "siwe", verifiedAt: new Date() });
     // Anchor submission is reserved for verified bindings.
     const anchor = await this.anchors.submit(bindingHash, "binding");
-    return { bindingId: binding.id, walletAddress: binding.walletAddress, bindingHash, anchorStatus: anchor?.status ?? "pending" };
+    return { bindingId: binding.id, walletAddress: binding.walletAddress, bindingHash, anchorStatus: anchor?.status ?? (this.anchors.enabled?.() === false ? "disabled" : "pending") };
   }
 
   // Watch-only: track an address with no signature. Never anchors, never downgrades an

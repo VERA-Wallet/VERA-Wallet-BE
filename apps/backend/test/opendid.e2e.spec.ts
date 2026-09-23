@@ -12,8 +12,8 @@ import { HttpExceptionEnvelopeFilter } from "../src/shared/http-exception.filter
 
 const origin = "http://localhost:3101";
 const claims = [{ code: "subjectId", value: "opaque-user", type: "text", format: "plain", hideValue: false }];
-const success = { result: true, issuer: "did:issuer", claims };
-const config = { MOCK_MODE: "true", PERSISTENCE: "memory", IDENTITY_PROVIDER: "opendid", JWT_SECRET: "test-opendid-secret-with-at-least-32-characters", FRONTEND_ORIGIN: origin, OPENDID_VERIFIER_URL: "http://verifier:8092/verifier", OPENDID_POLICY_ID: "policy", OPENDID_SUBJECT_CLAIM_CODE: "subjectId", OPENDID_TRUSTED_ISSUER_ID: "did:issuer", NODE_ENV: "test" };
+const success = { result: true, holder: "did:omn:holder", issuer: "did:issuer", claims };
+const config = { MOCK_MODE: "true", PERSISTENCE: "memory", IDENTITY_PROVIDER: "opendid", OPENDID_SUBJECT_BINDINGS: JSON.stringify({ "opaque-user": "did:omn:holder" }), JWT_SECRET: "test-opendid-secret-with-at-least-32-characters", FRONTEND_ORIGIN: origin, OPENDID_VERIFIER_URL: "http://verifier:8092/verifier", OPENDID_POLICY_ID: "policy", OPENDID_SUBJECT_CLAIM_CODE: "subjectId", OPENDID_TRUSTED_ISSUER_ID: "did:issuer", NODE_ENV: "test" };
 
 describe("Open DID browser authentication", () => {
   let app: INestApplication;
@@ -111,9 +111,16 @@ describe("Open DID browser authentication", () => {
     const response = await present(browser, next.body.data.offerId).expect(503);
     expect(response.headers["set-cookie"]).toBeUndefined();
   });
-  it("caps issuance per direct peer", async () => {
+  it("caps issuance per signed browser without blocking another browser behind the proxy", async () => {
     const browser = request.agent(app.getHttpServer());
     for (let i = 0; i < 10; i++) await offer(browser);
     await browser.post("/api/auth/did/offer").set("Origin", origin).send({ country: "KR" }).expect(429);
+    await offer(request.agent(app.getHttpServer()));
+  });
+  it("caps cookie-discarding callers with an independent global budget", async () => {
+    for (let i = 0; i < 100; i++) await offer(request.agent(app.getHttpServer()));
+    await request(app.getHttpServer()).post("/api/auth/did/offer").set("Origin", origin)
+      .set("Cookie", "vw_did_client=" + "a".repeat(32) + "." + "b".repeat(64))
+      .send({ country: "KR" }).expect(429);
   });
 });

@@ -2,6 +2,7 @@ import type { AnchorInspection, AnchorType } from "@vera/interfaces";
 import type { AnchorRecordView } from "../shared/repository.types";
 
 export interface AnchorSubmissionPort {
+  enabled?(): boolean;
   submit(payloadHash: string, type: AnchorType): Promise<AnchorRecordView | null>;
 }
 

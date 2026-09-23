@@ -3,5 +3,5 @@ import { identityProviderName } from "./shared/identity-mode";
 
 @Controller()
 export class AppController {
-  @Get("health") health() { return { status: "ok", service: "VeraWallet-BE", mockMode: process.env.MOCK_MODE !== "false", identityProvider: identityProviderName((key) => process.env[key]), timestamp: new Date().toISOString() }; }
+  @Get("health") health() { return { status: "ok", service: "VeraWallet-BE", mockMode: process.env.MOCK_MODE !== "false", anchoringEnabled: process.env.ANCHOR_ENABLED !== "false", identityProvider: identityProviderName((key) => process.env[key]), timestamp: new Date().toISOString() }; }
 }
