@@ -1,4 +1,4 @@
-import { Injectable } from "@nestjs/common";
+import { Injectable, Logger } from "@nestjs/common";
 import type { TransactionAvailabilityPort } from "./transaction.repository";
 import { IndexerService } from "./indexer.service";
 import { TransactionService } from "./transaction.service";
@@ -9,8 +9,18 @@ export const READ_GATE_WAIT_MS = 3_000;
 
 @Injectable()
 export class TransactionAvailabilityService implements TransactionAvailabilityPort {
+  private readonly logger = new Logger(TransactionAvailabilityService.name);
   constructor(private readonly transactions: TransactionService, private readonly indexer: IndexerService) {}
   async listOrSync(userId: string) {
+    const existing = await this.transactions.list(userId);
+    if (existing.length > 0) {
+      // New bindings still need their first import, but existing rows must not
+      // wait behind it. The indexer coalesces overlapping requests per user.
+      void this.indexer.ensureInitialSync(userId).catch(() => {
+        this.logger.warn("Background initial sync failed; existing transactions remain available.");
+      });
+      return existing;
+    }
     // Manual-only: perform ONLY the first sync per binding (gated on the initialSyncedAt marker).
     // Once a binding's first attempt has returned a result it is never re-synced on a read;
     // new transactions arrive via the manual resync endpoint. The wait is bounded (see READ_GATE_WAIT_MS):

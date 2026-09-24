@@ -274,7 +274,7 @@ export class IndexerService {
       // Best-effort market enrichment (DexScreener): dust gate + informational price.
       // A pricing failure must NEVER fail the chain, so it is fully guarded.
       try {
-        await this.pricing.enrich(transactions);
+        await measureOperation("sync.spot_prices", () => this.pricing.enrich(transactions));
       } catch (error) {
         skipped.push({ bindingId: binding.id, code: "price_enrichment_failed", message: sanitize((error as Error).message) });
       }
@@ -283,7 +283,7 @@ export class IndexerService {
       // real adapter leaves null. Distinct concern from the display-only spot price above,
       // and equally guarded — a basis lookup failure must never fail the chain.
       try {
-        await this.historicalPricing.enrich(transactions);
+        await measureOperation("sync.historical_prices", () => this.historicalPricing.enrich(transactions));
       } catch (error) {
         skipped.push({ bindingId: binding.id, code: "historical_price_enrichment_failed", message: sanitize((error as Error).message) });
       }
@@ -293,7 +293,7 @@ export class IndexerService {
         ...item,
         payload: { ...item.payload, _anchorPayloadHash: keccak256(toBytes(JSON.stringify({ txHash: item.txHash, eventType: item.eventType, payload: item.payload }))) },
       }));
-      const stored = await this.transactions.save(binding.id, userId, withHashes, (saved) => chain.saving(saved));
+      const stored = await measureOperation("sync.db_save", () => this.transactions.save(binding.id, userId, withHashes, (saved) => chain.saving(saved)));
       totals.normalized += stored.length;
 
       // Re-normalization can move a leg to another eventType (UNKNOWN transfer_out -> EXCHANGE swap)
@@ -317,7 +317,7 @@ export class IndexerService {
 
       // Anchor submission is reserved for verified (siwe) bindings; watch-only rows
       // are still fetched/normalized/stored, just never anchored.
-      if (binding.verifiedAt !== null) await this.anchorStored(stored, skipped, binding.id);
+      if (binding.verifiedAt !== null) await measureOperation("sync.anchor", () => this.anchorStored(stored, skipped, binding.id));
       chain.done(stored.length);
     } catch (error) {
       const message = sanitize((error as Error).message);

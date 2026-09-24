@@ -199,7 +199,7 @@ describe("PortfolioHoldingsService.holdings", () => {
     // ?address= 는 그 지갑만 읽는다(다른 지갑의 잔액 조회를 하지 않는다). 미등록 주소는 404.
     readBalances.mockClear();
     const only = await service.holdings("u1", WALLET_B.toUpperCase());
-    expect(readBalances).toHaveBeenCalledTimes(1);
+    expect(readBalances).not.toHaveBeenCalled(); // reuses the aggregate view's snapshot
     expect(only.walletAddresses).toEqual([WALLET_B]);
     expect(only.byWallet).toHaveLength(1);
     expect(only.holdings.find((holding) => holding.assetType === "NATIVE")!.amount).toBe("2");
@@ -220,6 +220,23 @@ describe("PortfolioHoldingsService.holdings", () => {
     expect(lookup).toHaveBeenCalledTimes(2);
     expect(lookup).toHaveBeenCalledWith(1, WETH_MAINNET);
     expect(lookup).not.toHaveBeenCalledWith(10, expect.anything());
+  });
+
+  it("shares in-flight balances across aggregate and individual views, with user isolation", async () => {
+    const { service, readBalances, advance } = makeService({});
+    let release!: (snapshot: BalanceSnapshot) => void;
+    readBalances.mockImplementationOnce(() => new Promise((resolve) => { release = resolve; }));
+    const aggregate = service.holdings("u1");
+    const individual = service.holdings("u1", WALLET_A);
+    await vi.waitFor(() => expect(readBalances).toHaveBeenCalledTimes(1));
+    release({ chains: [], skippedChainIds: [], truncatedChainIds: [] });
+    await Promise.all([aggregate, individual]);
+    expect(readBalances).toHaveBeenCalledTimes(1);
+    await service.holdings("u2", WALLET_A);
+    expect(readBalances).toHaveBeenCalledTimes(2);
+    advance(HOLDINGS_TTL_MS + 1);
+    await service.holdings("u1", WALLET_A);
+    expect(readBalances).toHaveBeenCalledTimes(3);
   });
 
   it("memoizes per user for the TTL and forgets a failed read immediately", async () => {

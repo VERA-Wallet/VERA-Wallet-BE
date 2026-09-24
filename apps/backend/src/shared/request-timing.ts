@@ -53,7 +53,7 @@ export function requestTiming(req: Request, res: Response, next: NextFunction) {
   context.run(state, next);
 }
 
-export async function measureOperation<T>(name: "sync.total" | "sync.scan" | "sync.persist", work: () => Promise<T>): Promise<T> {
+export async function measureOperation<T>(name: "sync.total" | "sync.scan" | "sync.persist" | "sync.spot_prices" | "sync.historical_prices" | "sync.db_save" | "sync.anchor", work: () => Promise<T>): Promise<T> {
   const start = performance.now(); let outcome = "ok";
   try { return await work(); } catch (error) { outcome = "error"; throw error; }
   finally {

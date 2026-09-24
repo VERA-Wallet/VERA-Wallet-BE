@@ -124,6 +124,24 @@ export class PortfolioHoldingsService {
   private readonly memo = new Map<string, { expiresAt: number; pending: Promise<HoldingsDto> }>();
   private readonly metadata = new Map<string, TokenMetadata | null>();
 
+  // Shared across aggregate and address-filtered views, but isolated per user.
+  private readonly balanceMemo = new Map<string, { expiresAt: number; pending: Promise<BalanceSnapshot> }>();
+
+  private readBalances(userId: string, address: string): Promise<BalanceSnapshot> {
+    const key = `${userId}:${address.toLowerCase()}`;
+    const at = this.now().getTime();
+    const hit = this.balanceMemo.get(key);
+    if (hit && hit.expiresAt > at) return hit.pending;
+    for (const [oldKey, entry] of this.balanceMemo) if (entry.expiresAt <= at) this.balanceMemo.delete(oldKey);
+    const entry = { expiresAt: at + HOLDINGS_TTL_MS, pending: undefined as unknown as Promise<BalanceSnapshot> };
+    entry.pending = this.balances.readBalances(address).catch((error: unknown) => {
+      if (this.balanceMemo.get(key) === entry) this.balanceMemo.delete(key);
+      throw error;
+    });
+    this.balanceMemo.set(key, entry);
+    return entry.pending;
+  }
+
   constructor(
     @Inject(WALLET_REPOSITORY) private readonly wallets: WalletRepository,
     @Inject(BALANCE_READER) private readonly balances: BalanceReader,
@@ -174,7 +192,7 @@ export class PortfolioHoldingsService {
     // Wallets are read one after another: the reader already fans out per chain under the provider's
     // shared compute-unit budget, and a second wallet in parallel would double that burst.
     const [snapshots, cost] = await Promise.all([
-      mapWithConcurrency(addresses, 1, (address) => this.balances.readBalances(address)),
+      mapWithConcurrency(addresses, 1, (address) => this.readBalances(userId, address)),
       this.snapshot.holdingsFor(userId, rows),
     ]);
     const ledger = indexLedgerAssets(rows);
