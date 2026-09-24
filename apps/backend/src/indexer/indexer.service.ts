@@ -1,3 +1,4 @@
+import { measureOperation } from "../shared/request-timing";
 import { Inject, Injectable, Logger, NotFoundException, ServiceUnavailableException } from "@nestjs/common";
 import type { ChainIndexer, ChainScanHooks, ChainScanOutcome } from "@vera/interfaces";
 import { keccak256, toBytes } from "viem";
@@ -148,7 +149,11 @@ export class IndexerService {
     };
   }
 
-  private async runSync(userId: string, bindings: BindingRecord[], onProgress?: (progress: SyncProgress) => void): Promise<SyncResult> {
+  private runSync(userId: string, bindings: BindingRecord[], onProgress?: (progress: SyncProgress) => void): Promise<SyncResult> {
+    return measureOperation("sync.total", () => this.runSyncWork(userId, bindings, onProgress));
+  }
+
+  private async runSyncWork(userId: string, bindings: BindingRecord[], onProgress?: (progress: SyncProgress) => void): Promise<SyncResult> {
     const skipped: SkipEntry[] = [];
     const totals: SyncTotals = { fetched: 0, normalized: 0, byChain: new Map<number, number>() };
     let allFailed = true;
@@ -188,10 +193,10 @@ export class IndexerService {
           onChainError: (chainId, message) => progress.chain(binding.id, chainId).fail(message),
           onChain: (outcome) => {
             persisted.add(outcome.chainId);
-            queue = queue.then(() => this.persistChain(userId, binding, outcome, progress, skipped, totals));
+            queue = queue.then(() => measureOperation("sync.persist", () => this.persistChain(userId, binding, outcome, progress, skipped, totals)));
           },
         };
-        const { transactions, chainHeads } = await this.indexer.fetchTransactions(binding.walletAddress, sinceByChain, hooks);
+        const { transactions, chainHeads } = await measureOperation("sync.scan", () => this.indexer.fetchTransactions(binding.walletAddress, sinceByChain, hooks));
         await queue;
 
         // Non-streaming adapters (mock, test fakes) only return the aggregate: persist whatever was not
