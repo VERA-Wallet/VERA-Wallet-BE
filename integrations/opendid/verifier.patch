@@ -1,0 +1,120 @@
+diff --git a/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/dto/ConfirmVerifyResDto.java b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/dto/ConfirmVerifyResDto.java
+index 5a73d6e..9952589 100644
+--- a/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/dto/ConfirmVerifyResDto.java
++++ b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/dto/ConfirmVerifyResDto.java
+@@ -32,6 +32,8 @@ import java.util.List;
+ public class ConfirmVerifyResDto {
+     private String vc;
+     private String issuer;
++    private String holder;
++    private String credentialId;
+     private List<Claim> claims;
+     private boolean result;
+ }
+\ No newline at end of file
+diff --git a/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/VerifierServiceImpl.java b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/VerifierServiceImpl.java
+index 4613a6f..a005e34 100644
+--- a/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/VerifierServiceImpl.java
++++ b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/VerifierServiceImpl.java
+@@ -408,12 +408,17 @@ public class VerifierServiceImpl implements VerifierService {
+                     VerifiablePresentation verifiablePresentation = new VerifiablePresentation();
+                     verifiablePresentation.fromJson(vp);
+                     List<VerifiableCredential> verifiableCredentials =  verifiablePresentation.getVerifiableCredential();
++                    String confirmedIssuer = ConfirmationIssuer.from(verifiableCredentials);
++                    String confirmedHolder = ConfirmationIssuer.holder(verifiablePresentation);
+                     verifiableCredentials.forEach(vc -> {
+                         List<@Valid Claim> claims = vc.getCredentialSubject().getClaims();
+                         returnClaims.addAll(claims);
+                     });
+                     return ConfirmVerifyResDto.builder()
+                             .result(true)
++                            .issuer(confirmedIssuer)
++                            .holder(confirmedHolder)
++                            .credentialId(verifiableCredentials.getFirst().getId())
+                             .claims(returnClaims)
+                             .build();
+                 } else {
+@@ -859,7 +864,7 @@ public class VerifierServiceImpl implements VerifierService {
+         byte[] mergeSharedSecretAndNonce = mergeSharedSecretAndNonce(sharedSecretKey, verifierNonce, e2eCipher);
+         byte[] decryptedData = decrypt(decodeEncVp, mergeSharedSecretAndNonce, decodeIv, e2eCipher, e2ePadding);
+         String decodeVP = new String(decryptedData, StandardCharsets.UTF_8);
+-        log.info("Decoded VP: {}", decodeVP);
++        // Do not write raw identity claims to logs.
+         VerifiablePresentation verifiablePresentation = new VerifiablePresentation();
+         verifiablePresentation.fromJson(decodeVP);
+         return verifiablePresentation;
+diff --git a/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuer.java b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuer.java
+new file mode 100644
+index 0000000..7e4b572
+--- /dev/null
++++ b/source/did-verifier-server/src/main/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuer.java
+@@ -0,0 +1,27 @@
++package org.omnione.did.verifier.v1.agent.service;
++
++import java.util.List;
++import org.omnione.did.data.model.vc.VerifiableCredential;
++
++/** Issuer of the single VC in the stored, already verified VP. Never infer it from policy. */
++final class ConfirmationIssuer {
++    private ConfirmationIssuer() {}
++    static String from(List<VerifiableCredential> credentials) {
++        if (credentials == null || credentials.size() != 1 || credentials.getFirst() == null
++                || credentials.getFirst().getIssuer() == null
++                || credentials.getFirst().getIssuer().getId() == null
++                || credentials.getFirst().getIssuer().getId().isBlank()) {
++            throw new IllegalArgumentException("Confirmation requires exactly one VC with an issuer.");
++        }
++        return credentials.getFirst().getIssuer().getId();
++    }
++    static String holder(org.omnione.did.data.model.vp.VerifiablePresentation vp) {
++        from(vp.getVerifiableCredential());
++        String holder = vp.getHolder();
++        var subject = vp.getVerifiableCredential().getFirst().getCredentialSubject();
++        if (holder == null || holder.isBlank() || subject == null || !holder.equals(subject.getId())) {
++            throw new IllegalArgumentException("Verified holder must own the credential.");
++        }
++        return holder;
++    }
++}
+diff --git a/source/did-verifier-server/src/test/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuerTest.java b/source/did-verifier-server/src/test/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuerTest.java
+new file mode 100644
+index 0000000..5a9866c
+--- /dev/null
++++ b/source/did-verifier-server/src/test/java/org/omnione/did/verifier/v1/agent/service/ConfirmationIssuerTest.java
+@@ -0,0 +1,36 @@
++package org.omnione.did.verifier.v1.agent.service;
++
++import java.util.List;
++import org.junit.jupiter.api.Test;
++import org.omnione.did.data.model.vc.VerifiableCredential;
++import static org.junit.jupiter.api.Assertions.*;
++
++class ConfirmationIssuerTest {
++    private VerifiableCredential credential(String issuer) {
++        VerifiableCredential vc = org.mockito.Mockito.mock(VerifiableCredential.class, org.mockito.Mockito.RETURNS_DEEP_STUBS);
++        org.mockito.Mockito.when(vc.getIssuer().getId()).thenReturn(issuer);
++        return vc;
++    }
++    @Test void usesActualCredentialIssuer() {
++        assertEquals("did:omn:other", ConfirmationIssuer.from(List.of(credential("did:omn:other"))));
++    }
++    @Test void rejectsMixedOrMultipleCredentials() {
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.from(List.of(credential("did:omn:a"), credential("did:omn:b"))));
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.from(List.of(credential("did:omn:a"), credential("did:omn:a"))));
++    }
++    @Test void rejectsMissingIssuerAndEmptyCredentialList() {
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.from(List.of(credential(""))));
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.from(List.of(new VerifiableCredential())));
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.from(List.of()));
++    }
++    @Test void bindsHolderToCredentialSubject() {
++        var vc = credential("did:omn:issuer");
++        var vp = org.mockito.Mockito.mock(org.omnione.did.data.model.vp.VerifiablePresentation.class);
++        org.mockito.Mockito.when(vp.getVerifiableCredential()).thenReturn(List.of(vc));
++        org.mockito.Mockito.when(vp.getHolder()).thenReturn("did:omn:alice");
++        org.mockito.Mockito.when(vc.getCredentialSubject().getId()).thenReturn("did:omn:alice");
++        assertEquals("did:omn:alice", ConfirmationIssuer.holder(vp));
++        org.mockito.Mockito.when(vc.getCredentialSubject().getId()).thenReturn("did:omn:bob");
++        assertThrows(IllegalArgumentException.class, () -> ConfirmationIssuer.holder(vp));
++    }
++}

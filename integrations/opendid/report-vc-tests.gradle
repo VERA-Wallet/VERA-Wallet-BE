@@ -1,0 +1,8 @@
+gradle.projectsEvaluated {
+    allprojects {
+        tasks.withType(Test).configureEach {
+            setExcludes([])
+            useJUnitPlatform()
+        }
+    }
+}

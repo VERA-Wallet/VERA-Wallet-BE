@@ -1,0 +1,300 @@
+diff --git a/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/IssueServiceBase.java b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/IssueServiceBase.java
+index 22a30e4..837a87c 100644
+--- a/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/IssueServiceBase.java
++++ b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/IssueServiceBase.java
+@@ -98,6 +98,10 @@ import java.util.stream.Collectors;
+ @Slf4j
+ @RequiredArgsConstructor
+ public abstract class IssueServiceBase implements IssueService {
++    @org.springframework.beans.factory.annotation.Autowired
++    private ReportIssueGuard reportIssueGuard;
++    @org.springframework.beans.factory.annotation.Autowired
++    private org.omnione.did.issuer.v1.agent.service.query.UserQueryService reportUsers;
+     private final VcProfileQueryService vcProfileQueryService;
+     private final VcOfferQueryService vcOfferQueryService;
+     private final TransactionService transactionService;
+@@ -125,6 +129,7 @@ public abstract class IssueServiceBase implements IssueService {
+         try {
+             log.debug("=== Starting Request Offer ===");
+             log.debug("\t--> Validating VC plan");
++            reportIssueGuard.authorizeCreation(request.getVcPlanId());
+             validateVcPlanId(request.getVcPlanId());
+ 
+             log.debug("\t--> Generating offer payload");
+@@ -204,6 +209,7 @@ public abstract class IssueServiceBase implements IssueService {
+                     .issueProfileId(issueProfile.getId())
+                     .build());
+ 
++            reportIssueGuard.bind(vcPlanId, request.getOfferId(), txId);
+             if (vcOffer != null) {
+                 // FIXME: If an offer has no limit, transactions are still being created.
+                 //  5times limit
+@@ -271,7 +277,9 @@ public abstract class IssueServiceBase implements IssueService {
+             String encodedSessionKey = encodedSessionKey((ECPrivateKey) keyPair.getPrivateKey());
+ 
+             log.debug("\t--> Find User by Holder data");
+-            User user = findUserByHolderAndVcSchemaId(holder, byVcPlanId.getVcSchemaId());
++            User user = reportIssueGuard.applies(vcPlanId)
++                    ? reportIssueGuard.reportUser(transaction.getTxId(), holder.getDid(), byVcPlanId.getVcSchemaId(), reportUsers)
++                    : findUserByHolderAndVcSchemaId(holder, byVcPlanId.getVcSchemaId());
+ 
+             log.debug("\t--> VC Profile save to DB");
+             VcProfile vcProfile = VcProfile.builder()
+@@ -359,7 +367,7 @@ public abstract class IssueServiceBase implements IssueService {
+             log.debug("\t--> Parse Request VC");
+             ReqVc reqVc = parseRequestVc(decryptedRequestVc);
+             validateRequestVc(transaction, reqVc);
+-            System.out.println("reqVc.toJson() = " + reqVc.toJson());
++
+             log.debug("\t--> Find User By VC Profile");
+             Long vcSchemaId = issueProfileQueryService.findById(transaction.getIssueProfileId()).getVcSchemaId();
+             User user = findUserByVcProfileAndVcSchemaId(vcProfile, vcSchemaId); // @@
+@@ -367,8 +375,8 @@ public abstract class IssueServiceBase implements IssueService {
+ 
+             log.debug("\t--> Issuing VC");
+             VerifiableCredential verifiableCredential = issueVerifiableCredential(vcManager,
+-                    vcProfile.getDid(), user.getData(), vcSchemaId);
+-            log.debug("\t--> VerifiableCredential {}", verifiableCredential.toJson());
++                    vcProfile.getDid(), reportIssueGuard.claims(transaction.getVcPlanId(), transaction.getTxId(), vcProfile.getDid(), user.getData()), vcSchemaId);
++
+ 
+             log.debug("\t--> Registering VC to B/C");
+             VcMeta vcMeta = vcManager.generateVcMetaData(verifiableCredential, issuerInfoQueryService.getIssuerInfo().getCertificateUrl());
+@@ -606,9 +614,9 @@ public abstract class IssueServiceBase implements IssueService {
+     private Vc handleVcCreationOrUpdate(User user, String holderDid, Transaction transaction, VcMeta vcMeta) {
+         String vcPlanId = transaction.getVcPlanId();
+         String txId = transaction.getTxId();
+-        return vcQueryService.findByUserIdAndVcPlanId(user.getId(), vcPlanId)
++        return (reportIssueGuard.applies(vcPlanId) ? java.util.Optional.<Vc>empty() : vcQueryService.findByUserIdAndVcPlanId(user.getId(), vcPlanId))
+                 .map(existingVc -> {
+-                    revokeVc(existingVc);
++                    if (!reportIssueGuard.applies(vcPlanId)) revokeVc(existingVc);
+                     return Vc.builder()
+                             .issuedAt(DateTimeUtil.parseUtcTimeStringToInstant(vcMeta.getIssuanceDate()))
+                             .expiredAt(DateTimeUtil.parseUtcTimeStringToInstant(vcMeta.getValidUntil()))
+diff --git a/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/controller/ReportIssueController.java b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/controller/ReportIssueController.java
+new file mode 100644
+index 0000000..3eaacf1
+--- /dev/null
++++ b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/controller/ReportIssueController.java
+@@ -0,0 +1,105 @@
++package org.omnione.did.issuer.v1.agent.controller;
++
++import com.fasterxml.jackson.databind.ObjectMapper;
++import org.omnione.did.issuer.v1.agent.service.*;
++import org.omnione.did.issuer.v1.agent.service.query.*;
++import org.omnione.did.issuer.v1.admin.service.query.IssueProfileQueryService;
++import org.omnione.did.issuer.v1.agent.dto.vc.OfferIssueVcReqDto;
++import org.omnione.did.base.db.domain.User;
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.web.bind.annotation.*;
++import org.springframework.http.HttpStatus;
++import org.springframework.web.server.ResponseStatusException;
++import org.springframework.transaction.annotation.Transactional;
++import java.nio.charset.StandardCharsets;
++import java.security.MessageDigest;
++import java.time.Instant;
++import java.util.*;
++
++@RestController
++@RequestMapping("/issuer/api/v1/verawallet/report")
++public class ReportIssueController {
++    private final ReportIssueGuard guard;
++    private final IssueService issue;
++    private final UserQueryService users;
++    private final IssueProfileQueryService profiles;
++    private final VcQueryService vcs;
++    private final String key;
++    @org.springframework.beans.factory.annotation.Autowired
++    private org.omnione.did.base.db.repository.VcRepository vcRepository;
++    private final ObjectMapper json = new ObjectMapper();
++    public ReportIssueController(ReportIssueGuard guard, @org.springframework.beans.factory.annotation.Qualifier("issueServiceHelper") IssueService issue, UserQueryService users,
++        IssueProfileQueryService profiles, VcQueryService vcs, @Value("${verawallet.report-service-key:}") String key) {
++        this.guard=guard; this.issue=issue; this.users=users; this.profiles=profiles; this.vcs=vcs; this.key=key;
++    }
++    @ExceptionHandler(ResponseStatusException.class)
++    public org.springframework.http.ResponseEntity<Map<String,String>> failure(ResponseStatusException error) {
++        return org.springframework.http.ResponseEntity.status(error.getStatusCode()).body(Map.of("code", "report_request_rejected"));
++    }
++    private void authorize(String supplied) {
++        if (key.length()<32 || supplied==null || !MessageDigest.isEqual(key.getBytes(StandardCharsets.UTF_8), supplied.getBytes(StandardCharsets.UTF_8))) throw new ResponseStatusException(HttpStatus.FORBIDDEN);
++        guard.plan();
++    }
++    @PostMapping("/capabilities") public Map<String,Object> capabilities(@RequestHeader(value="x-verawallet-service-key",required=false) String supplied) {
++        authorize(supplied);
++        return Map.of("contract","verawallet-report-vc-v1","holderBound",true,"immutableClaims",true,"issuanceReceipt",true);
++    }
++    @PostMapping("/offers") @Transactional
++    public synchronized Map<String,Object> offer(@RequestHeader(value="x-verawallet-service-key",required=false) String supplied, @RequestBody Map<String,Object> body) throws Exception {
++        authorize(supplied);
++        String requestId = Objects.toString(body.get("requestId"), ""); UUID.fromString(requestId);
++        String holder = Objects.toString(body.get("holderDid"), "");
++        if (!holder.matches("^did:[a-z0-9]+:.+$") || !(body.get("snapshot") instanceof Map<?,?> snapshot)) throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
++        var existing=guard.find(requestId);
++        if (existing!=null) {
++            if (!holder.equals(existing.get("holder")) || !json.readTree((String)existing.get("snapshot")).equals(json.valueToTree(snapshot))) throw new ResponseStatusException(HttpStatus.CONFLICT);
++            return json.readValue((String)existing.get("payload"), Map.class);
++        }
++        String root=Objects.toString(snapshot.get("evidenceRoot"), "");
++        if (!root.matches("^0x[a-fA-F0-9]{64}$") || !holder.equals(snapshot.get("holderDid"))) throw new ResponseStatusException(HttpStatus.BAD_REQUEST);
++        Map<String,String> claims=new LinkedHashMap<>();
++        claims.put("org.verawallet.report.reportId", requestId);
++        claims.put("org.verawallet.report.evidenceRoot", root);
++        claims.put("org.verawallet.report.countryCode", Objects.toString(snapshot.get("countryCode")));
++        claims.put("org.verawallet.report.taxYear", Objects.toString(snapshot.get("taxYear")));
++        claims.put("org.verawallet.report.disclaimer", "estimated_tax_report");
++        // Amounts are deliberately absent from v1: only basic disclosure is advertised.
++        String claimJson=json.writeValueAsString(claims);
++        Long schema=profiles.findByVcPlanId(guard.plan()).getVcSchemaId();
++        if (users.findByDidAndVcSchemaId(holder,schema).isEmpty()) users.save(User.builder().did(holder).vcSchemaId(schema).data("{}").pii(requestId).build());
++        OfferIssueVcReqDto request=new OfferIssueVcReqDto(); request.setVcPlanId(guard.plan());
++        Map payload;
++        guard.internal(true);
++        try { payload=json.convertValue(issue.requestOffer(request).getIssueOfferPayload(), Map.class); }
++        finally { guard.internal(false); }
++        String expiry=Objects.toString(payload.get("validUntil"));
++        var answer=Map.<String,Object>of("offerId",payload.get("offerId"),"payload",payload,"expiresAt",expiry);
++        guard.save(requestId,Objects.toString(payload.get("offerId")),holder,claimJson,json.writeValueAsString(snapshot),json.writeValueAsString(answer),expiry);
++        return answer;
++    }
++    @PostMapping("/result") public Map<String,Object> result(@RequestHeader(value="x-verawallet-service-key",required=false) String supplied,@RequestBody Map<String,Object> body) {
++        authorize(supplied);
++        String requestId=Objects.toString(body.get("requestId"), "");
++        var row=guard.find(requestId);
++        if (row==null || !Objects.equals(row.get("offer_id"), body.get("offerId"))) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
++        if (Boolean.TRUE.equals(row.get("cancelled"))) throw new ResponseStatusException(HttpStatus.CONFLICT);
++        if (row.get("tx_id")==null) return Map.of("status","pending");
++        var completed=issue.issueVcResult((String)row.get("offer_id"));
++        if (!Boolean.TRUE.equals(completed.getResult())) return Map.of("status","pending");
++        var vc=vcs.findByTxId((String)row.get("tx_id"));
++        if (!vc.getDid().equals(row.get("holder"))) throw new ResponseStatusException(HttpStatus.CONFLICT);
++        try {
++            var snapshot=json.readTree((String)row.get("snapshot"));
++            return Map.of("status","issued","requestId",requestId,"credentialId",vc.getVcId(),"holderDid",vc.getDid(),"evidenceRoot",snapshot.get("evidenceRoot").asText(),"issuedAt",vc.getIssuedAt().toString());
++        } catch (Exception e) { throw new ResponseStatusException(HttpStatus.CONFLICT); }
++    }
++    @PostMapping("/credential-status") public Map<String,Object> credentialStatus(@RequestHeader(value="x-verawallet-service-key",required=false) String supplied,@RequestBody Map<String,Object> body) {
++        authorize(supplied);
++        var vc=vcRepository.findByVcId(Objects.toString(body.get("credentialId"), "")).orElseThrow(() -> new ResponseStatusException(HttpStatus.NOT_FOUND));
++        if (!guard.plan().equals(vc.getVcPlanId())) throw new ResponseStatusException(HttpStatus.NOT_FOUND);
++        return Map.of("status",vc.getStatus(),"holderDid",vc.getDid(),"credentialId",vc.getVcId());
++    }
++    @PostMapping("/cancel") public Map<String,Object> cancel(@RequestHeader(value="x-verawallet-service-key",required=false) String supplied,@RequestBody Map<String,Object> body) {
++        authorize(supplied); return Map.of("cancelled",guard.cancel(Objects.toString(body.get("requestId"), "")));
++    }
++}
+diff --git a/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuard.java b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuard.java
+new file mode 100644
+index 0000000..e277f97
+--- /dev/null
++++ b/source/did-issuer-server/src/main/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuard.java
+@@ -0,0 +1,55 @@
++package org.omnione.did.issuer.v1.agent.service;
++
++import org.springframework.beans.factory.annotation.Value;
++import org.springframework.jdbc.core.JdbcTemplate;
++import org.springframework.stereotype.Component;
++import org.springframework.web.server.ResponseStatusException;
++import org.springframework.http.HttpStatus;
++import java.util.Map;
++
++/** Durable, immutable report issuance authorization. No report offer can use mutable User.data. */
++@Component
++public class ReportIssueGuard {
++    private final JdbcTemplate db;
++    private final String plan;
++    private final ThreadLocal<Boolean> internal = ThreadLocal.withInitial(() -> false);
++    public ReportIssueGuard(JdbcTemplate db, @Value("${verawallet.report-plan-id:}") String plan) {
++        this.db = db; this.plan = plan;
++        if (!plan.isBlank()) db.execute("CREATE TABLE IF NOT EXISTS verawallet_report_offer (request_id varchar(64) PRIMARY KEY, offer_id varchar(64) UNIQUE NOT NULL, holder text NOT NULL, claims text NOT NULL, snapshot text NOT NULL, payload text NOT NULL, expires_at timestamptz NOT NULL, tx_id text UNIQUE, cancelled boolean NOT NULL DEFAULT false)");
++    }
++    public String plan() { if (plan.isBlank()) throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE); return plan; }
++    public boolean applies(String candidate) { return !plan.isBlank() && plan.equals(candidate); }
++    public void internal(boolean enabled) { if (enabled) internal.set(true); else internal.remove(); }
++    public void authorizeCreation(String candidate) {
++        if (applies(candidate) && !internal.get()) throw new ResponseStatusException(HttpStatus.FORBIDDEN);
++    }
++    public void bind(String candidate, String offerId, String txId) {
++        if (!applies(candidate)) return;
++        int changed = db.update("UPDATE verawallet_report_offer SET tx_id=? WHERE offer_id=? AND tx_id IS NULL AND NOT cancelled AND expires_at>now()", txId, offerId);
++        if (changed != 1) throw new ResponseStatusException(HttpStatus.CONFLICT);
++    }
++    public String claims(String candidate, String txId, String holder, String fallback) {
++        if (!applies(candidate)) return fallback;
++        var rows = db.queryForList("SELECT claims FROM verawallet_report_offer WHERE tx_id=? AND holder=? AND NOT cancelled AND expires_at>now() FOR UPDATE", txId, holder);
++        if (rows.size() != 1) throw new ResponseStatusException(HttpStatus.FORBIDDEN);
++        return (String) rows.getFirst().get("claims");
++    }
++    public org.omnione.did.base.db.domain.User reportUser(String txId, String holder, Long schemaId,
++            org.omnione.did.issuer.v1.agent.service.query.UserQueryService users) {
++        // The protected offer authorizes this holder, not the generic issuer-init PII lookup.
++        // Recheck expiry/cancellation and take the same row lock before profile creation.
++        claims(plan(), txId, holder, null);
++        return users.findByDidAndVcSchemaId(holder, schemaId)
++                .orElseThrow(() -> new ResponseStatusException(HttpStatus.FORBIDDEN));
++    }
++    public Map<String, Object> find(String requestId) {
++        var rows = db.queryForList("SELECT * FROM verawallet_report_offer WHERE request_id=?", requestId);
++        return rows.isEmpty() ? null : rows.getFirst();
++    }
++    public void save(String requestId, String offerId, String holder, String claims, String snapshot, String payload, String expiry) {
++        db.update("INSERT INTO verawallet_report_offer(request_id,offer_id,holder,claims,snapshot,payload,expires_at) VALUES(?,?,?,?,?,?,?::timestamptz)", requestId, offerId, holder, claims, snapshot, payload, expiry);
++    }
++    public boolean cancel(String requestId) {
++        return db.update("UPDATE verawallet_report_offer SET cancelled=true WHERE request_id=?", requestId) == 1;
++    }
++}
+diff --git a/source/did-issuer-server/src/test/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuardTest.java b/source/did-issuer-server/src/test/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuardTest.java
+new file mode 100644
+index 0000000..3e03a2f
+--- /dev/null
++++ b/source/did-issuer-server/src/test/java/org/omnione/did/issuer/v1/agent/service/ReportIssueGuardTest.java
+@@ -0,0 +1,48 @@
++package org.omnione.did.issuer.v1.agent.service;
++import org.junit.jupiter.api.Test;
++import org.springframework.jdbc.core.JdbcTemplate;
++import java.util.List;
++import java.util.Map;
++import static org.junit.jupiter.api.Assertions.*;
++import static org.mockito.Mockito.*;
++class ReportIssueGuardTest {
++  @Test void publicReportOffersAreForbiddenButLegacyPlansRemainAvailable() {
++    var guard=new ReportIssueGuard(mock(JdbcTemplate.class),"report-plan");
++    assertThrows(RuntimeException.class,()->guard.authorizeCreation("report-plan"));
++    assertDoesNotThrow(()->guard.authorizeCreation("legacy"));
++    guard.internal(true); assertDoesNotThrow(()->guard.authorizeCreation("report-plan"));
++    guard.internal(false); assertThrows(RuntimeException.class,()->guard.authorizeCreation("report-plan"));
++  }
++  @Test void reportClaimsNeverFallBackToMutableUserData() {
++    var db=mock(JdbcTemplate.class); var guard=new ReportIssueGuard(db,"report-plan");
++    when(db.queryForList(anyString(),anyString(),anyString())).thenReturn(List.of());
++    assertThrows(RuntimeException.class,()->guard.claims("report-plan","tx","wrong-holder","mutable-data"));
++    assertEquals("legacy-data",guard.claims("legacy","tx","holder","legacy-data"));
++  }
++  @Test void validHolderReceivesOnlyImmutableSnapshot() {
++    var db=mock(JdbcTemplate.class); var guard=new ReportIssueGuard(db,"report-plan");
++    when(db.queryForList(anyString(),anyString(),anyString())).thenReturn(List.of(Map.of("claims","immutable-data")));
++    assertEquals("immutable-data",guard.claims("report-plan","tx","holder","mutable-data"));
++  }
++  @Test void consumedExpiredOrUnregisteredOfferCannotBind() {
++    var db=mock(JdbcTemplate.class); var guard=new ReportIssueGuard(db,"report-plan");
++    when(db.update(anyString(),anyString(),anyString())).thenReturn(0);
++    assertThrows(RuntimeException.class,()->guard.bind("report-plan","offer","tx"));
++  }
++  @Test void reportProfileResolvesOnlyTheAuthorizedDidAndSchema() {
++    var db=mock(JdbcTemplate.class); var guard=new ReportIssueGuard(db,"report-plan");
++    var users=mock(org.omnione.did.issuer.v1.agent.service.query.UserQueryService.class);
++    var user=org.omnione.did.base.db.domain.User.builder().did("did:omn:holder").vcSchemaId(3L).build();
++    when(db.queryForList(anyString(),eq("tx"),eq("did:omn:holder"))).thenReturn(List.of(Map.of("claims","{}")));
++    when(users.findByDidAndVcSchemaId("did:omn:holder",3L)).thenReturn(java.util.Optional.of(user));
++    assertSame(user,guard.reportUser("tx","did:omn:holder",3L,users));
++    verify(users,never()).findByPiiAndVcSchemaId(any(),any());
++  }
++  @Test void profileLookupCannotBypassOfferHolderBinding() {
++    var db=mock(JdbcTemplate.class); var guard=new ReportIssueGuard(db,"report-plan");
++    var users=mock(org.omnione.did.issuer.v1.agent.service.query.UserQueryService.class);
++    when(db.queryForList(anyString(),anyString(),anyString())).thenReturn(List.of());
++    assertThrows(RuntimeException.class,()->guard.reportUser("tx","wrong-holder",3L,users));
++    verifyNoInteractions(users);
++  }
++}

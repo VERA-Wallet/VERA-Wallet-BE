@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { ReportVcModule } from "./report-vc/report-vc.module";
 import { BullModule } from "@nestjs/bull";
 import { Module } from "@nestjs/common";
 import { ConfigModule, ConfigService } from "@nestjs/config";
@@ -24,7 +25,7 @@ const queueImports = process.env.MOCK_MODE === "false"
   : [];
 
 @Module({
-  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, WalletUnbindModule, PortfolioModule, TaxModule, ReportModule, TaxEvidenceModule],
+  imports: [ConfigModule.forRoot({ isGlobal: true }), ...queueImports, AnchorModule, AuthModule, WalletModule, IndexerModule, WalletUnbindModule, PortfolioModule, TaxModule, ReportModule, TaxEvidenceModule, ReportVcModule],
   controllers: [AppController],
 })
 export class AppModule {}

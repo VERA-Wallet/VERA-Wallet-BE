@@ -180,3 +180,54 @@ model OpenDidAttempt {
   @@index([expiresAt])
   @@index([secretHash])
 }
+
+/// Separate from login attempts: never creates a User or a login JWT.
+model ReportVcWallet {
+  userId       String   @id
+  holderDid    String   @unique
+  cxVerifiedAt DateTime
+  linkedAt     DateTime @default(now())
+}
+
+/// Persisted browser-bound workflow. No raw VP or authentication token is stored.
+model ReportVcAttempt {
+  id             String   @id
+  purpose        String
+  userId         String?
+  secretHash     String
+  status         String
+  upstreamId     String?  @unique
+  idempotencyKey String?
+  requestHash    String?
+  holderDid      String?
+  evidenceRoot   String?
+  snapshot       Json?
+  offer          Json?
+  result         Json?
+  disclosure     String?
+  expiresAt      DateTime
+  nextPollAt     DateTime
+  leaseToken     String?
+  leaseUntil     DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, purpose, status])
+  @@index([expiresAt])
+}
+
+model ReportVcCredential {
+  id           String   @id
+  issuanceId   String   @unique
+  userId       String
+  holderDid    String
+  evidenceRoot String
+  countryCode  String
+  taxYear      Int
+  snapshot     Json
+  issuedAt     DateTime
+  createdAt    DateTime @default(now())
+
+  @@index([userId, countryCode, taxYear, issuedAt])
+}
