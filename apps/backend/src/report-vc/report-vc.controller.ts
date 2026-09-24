@@ -17,7 +17,7 @@ export class ReportVcController {
   @Get("capabilities") async capabilities(@Res({ passthrough: true }) res: Response) { return this.envelope(await this.vc.capabilities(), res); }
   @UseGuards(JwtAuthGuard) @Get("wallet") async wallet(@CurrentUser() user: AuthenticatedUser, @Res({ passthrough: true }) res: Response) { return this.envelope(await this.vc.wallet(user.sub), res); }
   @UseGuards(JwtAuthGuard) @Post("wallet/link-attempts") async link(@CurrentUser() user: AuthenticatedUser, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
-    this.vc.origin(req); return this.envelope(await this.vc.link(user.sub, res), res);
+    this.vc.origin(req); return this.envelope(await this.vc.link(user.sub, res, req), res);
   }
   @UseGuards(JwtAuthGuard) @Get("wallet/link-attempts/:id") async linkStatus(@CurrentUser() user: AuthenticatedUser, @Param("id") id: string, @Req() req: Request, @Res({ passthrough: true }) res: Response) {
     return this.envelope(await this.vc.poll(id, "link", user.sub, req, res), res);

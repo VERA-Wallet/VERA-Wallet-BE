@@ -41,4 +41,16 @@ describe.skipIf(!url)("report VC durable concurrency", () => {
     const result = await Promise.all([first.acquire(attempt.id, "a", new Date()), second.acquire(attempt.id, "b", new Date())]);
     expect(result.filter(Boolean)).toHaveLength(1);
   });
+  it("resumes only this account's unexpired, unfinished link across connections", async () => {
+    await a.reportVcAttempt.updateMany({ where: { userId }, data: { status: "cancelled" } });
+    const attempt = await first.create(row());
+    expect((await second.activeLink(userId))?.id).toBe(attempt.id);
+    expect(await second.activeLink(randomUUID())).toBeNull();
+    await a.reportVcAttempt.update({ where: { id: attempt.id }, data: { expiresAt: new Date(0) } });
+    expect(await second.activeLink(userId)).toBeNull();
+    const next = await first.create(row());
+    await first.cancel(next.id);
+    expect(await second.activeLink(userId)).toBeNull();
+  });
+
 });

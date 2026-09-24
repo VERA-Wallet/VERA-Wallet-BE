@@ -31,6 +31,9 @@ export class ReportVcStore {
   latestAttempt(userId: string, evidenceRoot: string) {
     return this.db.reportVcAttempt.findFirst({ where: { userId, evidenceRoot, purpose: "issue" }, orderBy: { createdAt: "desc" } });
   }
+  activeLink(userId: string) {
+    return this.db.reportVcAttempt.findFirst({ where: { userId, purpose: "link", status: { in: ["creating", "pending"] }, expiresAt: { gt: new Date() } }, orderBy: { createdAt: "desc" } });
+  }
   attempt(id: string) { return this.db.reportVcAttempt.findUnique({ where: { id } }); }
   async create(data: Prisma.ReportVcAttemptUncheckedCreateInput) {
     return this.db.$transaction(async tx => {

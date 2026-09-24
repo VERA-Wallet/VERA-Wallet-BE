@@ -9,7 +9,7 @@ import type { AnchorQueryPort } from "../anchor/anchor.port";
 import { secretHash } from "./report-vc.policy";
 const secret = "a".repeat(64);
 const configuration = { REPORT_VC_ENABLED: "true", MOCK_MODE: "false", PERSISTENCE: "prisma", JWT_SECRET: "k".repeat(40), FRONTEND_ORIGIN: "https://vera.test", REPORT_VC_ISSUER_DID: "did:omn:issuer" };
-const store = { cx: vi.fn(), wallet: vi.fn(), attempt: vi.fn(), acquire: vi.fn(), release: vi.fn(), complete: vi.fn(), cancel: vi.fn(), credential: vi.fn(), evidence: vi.fn(), latestEvidence: vi.fn() };
+const store = { activeLink: vi.fn(), create: vi.fn(), cx: vi.fn(), wallet: vi.fn(), attempt: vi.fn(), acquire: vi.fn(), release: vi.fn(), complete: vi.fn(), cancel: vi.fn(), credential: vi.fn(), evidence: vi.fn(), latestEvidence: vi.fn() };
 const gateway = { ready: vi.fn(), call: vi.fn() };
 const anchors = { inspect: vi.fn() };
 const req = (cookie = secret) => ({ cookies: { vw_vc_link_attempt: cookie, vw_vc_issue_attempt: cookie, vw_vc_verify_attempt: cookie }, headers: { origin: "https://vera.test" } }) as unknown as Request;
@@ -79,4 +79,34 @@ it("requires explicitly disabled mock mode", () => {
   const config = { ...configuration, MOCK_MODE: undefined };
   const disabled = new ReportVcService(new ConfigService(config), store as unknown as ReportVcStore, gateway as unknown as ReportVcGateway, anchors as unknown as AnchorQueryPort);
   expect(disabled.enabled()).toBe(false);
+});
+
+
+describe("resuming a credential wallet link", () => {
+  it("returns the original QR and expiry to the same browser without creating another offer", async () => {
+    const row = { ...attempt(), offer: { qr: { text: "original-qr" } } };
+    store.activeLink.mockResolvedValue(row);
+    const result = await service.link("user", res(), req());
+    expect(result).toMatchObject({ attemptId: row.id, qr: row.offer.qr, expiresAt: row.expiresAt.toISOString() });
+    expect(store.activeLink).toHaveBeenCalledWith("user");
+    expect(store.create).not.toHaveBeenCalled();
+    expect(gateway.call).not.toHaveBeenCalled();
+  });
+  it.each([undefined, "b".repeat(64)])("does not expose the active QR to an unbound browser", async cookie => {
+    store.activeLink.mockResolvedValue({ ...attempt(), offer: { qr: { text: "private-qr" } } });
+    const request = cookie ? req(cookie) : { cookies: {} } as Request;
+    await expect(service.link("user", res(), request)).rejects.toThrow("link_in_progress");
+    expect(gateway.call).not.toHaveBeenCalled();
+  });
+  it("does not send a second upstream creation while an offer is being prepared", async () => {
+    store.activeLink.mockResolvedValue({ ...attempt(), status: "creating", offer: null });
+    await expect(service.link("user", res(), req())).rejects.toThrow("link_in_progress");
+    expect(gateway.call).not.toHaveBeenCalled();
+  });
+  it("creates a new attempt when there is no live link to resume", async () => {
+    store.activeLink.mockResolvedValue(null);
+    store.create.mockImplementation(async data => ({ ...data, status: "pending", offer: { qr: { text: "new-qr" } } }));
+    expect(await service.link("user", res(), req())).toMatchObject({ qr: { text: "new-qr" } });
+    expect(store.create).toHaveBeenCalledOnce();
+  });
 });

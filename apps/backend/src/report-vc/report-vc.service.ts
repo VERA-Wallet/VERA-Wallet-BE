@@ -95,10 +95,19 @@ export class ReportVcService implements OnModuleInit, OnModuleDestroy {
     return { ...(row.purpose === "link" ? { attemptId: row.id } : row.purpose === "verify" ? { verificationId: row.id, disclosure: row.disclosure } : this.view(row)),
       qr: row.offer.qr, expiresAt: row.expiresAt.toISOString(), pollAfterMs: 2000 };
   }
-  async link(userId: string, response: Response) {
+  async link(userId: string, response: Response, request?: Request) {
     const cx = await this.requireCx(userId);
     // Linking credentials changes account ownership context; require a recent real CX authentication.
     if (Date.now() - cx.verifiedAt.getTime() > 15 * 60_000) reject("cx_reauthentication_required", 403);
+    const active = await this.store.activeLink(userId);
+    if (active) {
+      // Resume only the originating browser. Returning a QR must not grant a different
+      // browser the polling/cancellation capability merely because it knows the account.
+      if (!matchesSecret(request?.cookies?.[COOKIES.link], active.secretHash)) reject("link_in_progress", 409);
+      if (active.status !== "pending" || !object(active.offer)) reject("link_in_progress", 409);
+      // offer() reuses the persisted QR and original expiresAt; no upstream call or timer reset.
+      return this.offer(active, {}, response);
+    }
     const row = await this.newAttempt("link", userId, { snapshot: jsonValue({ cxVerifiedAt: cx.verifiedAt.toISOString() }) });
     return this.offer(row, {}, response);
   }
