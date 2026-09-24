@@ -1,3 +1,6 @@
+import { SharedModule } from "../shared/shared.module";
+import { OpenDidAttemptStore } from "./opendid-attempt.store";
+import { OpenDidLoginService } from "./opendid-login.service";
 import { Module } from "@nestjs/common";
 import { ConfigService } from "@nestjs/config";
 import { JwtModule } from "@nestjs/jwt";
@@ -12,6 +15,7 @@ import { JwtStrategy } from "./jwt.strategy";
 @Module({
   imports: [
     IdentityModule,
+    SharedModule,
     PassportModule,
     JwtModule.registerAsync({
       inject: [ConfigService],
@@ -19,7 +23,7 @@ import { JwtStrategy } from "./jwt.strategy";
     }),
   ],
   controllers: [AuthController, FrontendAuthController],
-  providers: [AuthService, JwtStrategy, JwtAuthGuard],
+  providers: [OpenDidAttemptStore, OpenDidLoginService, AuthService, JwtStrategy, JwtAuthGuard],
   exports: [AuthService, JwtAuthGuard, JwtModule],
 })
 export class AuthModule {}

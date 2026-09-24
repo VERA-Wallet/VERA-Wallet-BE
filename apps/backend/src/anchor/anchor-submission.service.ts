@@ -13,3 +13,9 @@ export class AnchorSubmissionService implements AnchorSubmissionPort {
     return this.anchors.get(payloadHash);
   }
 }
+
+@Injectable()
+export class DisabledAnchorSubmissionService implements AnchorSubmissionPort {
+  enabled() { return false; }
+  async submit(_payloadHash: string, _type: AnchorType) { return null; }
+}

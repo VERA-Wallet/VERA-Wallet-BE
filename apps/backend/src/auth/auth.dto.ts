@@ -1,4 +1,4 @@
-import { IsIn, IsOptional, IsString, MinLength } from "class-validator";
+import { IsIn, IsOptional, IsString, MinLength, MaxLength } from "class-validator";
 
 export class StartVerificationDto {
   @IsOptional() @IsString() sessionId?: string;
@@ -8,6 +8,7 @@ export class VerificationCallbackDto {
   @IsOptional() @IsIn(["KR", "DE", "US", "UK"]) country?: string;
 }
 export class PresentDidDto {
+  @IsOptional() @IsString() @MinLength(1) @MaxLength(256) offerId?: string;
   @IsIn(["KR", "DE", "US", "UK"]) country!: "KR" | "DE" | "US" | "UK";
   /**
    * OmniOne CX 표준인증창 성공 콜백의 일회용 토큰(FE `lib/omnione/oacx.ts`).
@@ -17,4 +18,8 @@ export class PresentDidDto {
    * 인증창을 쓰지 않는 mock 흐름(e2e·계약 테스트)은 이 필드를 생략한다.
    */
   @IsOptional() @IsString() @MinLength(1) cxToken?: string;
+}
+
+export class DidOfferDto {
+  @IsIn(["KR", "DE", "US", "UK"]) country!: "KR" | "DE" | "US" | "UK";
 }

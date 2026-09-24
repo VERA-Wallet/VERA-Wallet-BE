@@ -7,7 +7,7 @@ import { AnchorController } from "./anchor.controller";
 import { MockAnchorAdapter, OmniOneChainAdapter } from "./anchor.adapters";
 import { AnchorProcessor, BullAnchorDispatcher, ImmediateAnchorDispatcher } from "./anchor.queue";
 import { AnchorService } from "./anchor.service";
-import { AnchorSubmissionService } from "./anchor-submission.service";
+import { AnchorSubmissionService, DisabledAnchorSubmissionService } from "./anchor-submission.service";
 import { MockAnchorRepository, PrismaAnchorRepository } from "./anchor.repository.adapters";
 import { ANCHOR_DISPATCHER, ANCHOR_QUERY, ANCHOR_REPOSITORY, ANCHOR_SUBMISSION, EVIDENCE_ANCHOR } from "./anchor.tokens";
 
@@ -25,8 +25,9 @@ const mock = process.env.MOCK_MODE !== "false";
     { provide: ANCHOR_REPOSITORY, useFactory: (config: ConfigService, memory: MockAnchorRepository, prisma: PrismaAnchorRepository) => usePrismaPersistence(config) ? prisma : memory, inject: [ConfigService, MockAnchorRepository, PrismaAnchorRepository] },
     AnchorService,
     AnchorSubmissionService,
+    DisabledAnchorSubmissionService,
     { provide: ANCHOR_QUERY, useExisting: AnchorService },
-    { provide: ANCHOR_SUBMISSION, useExisting: AnchorSubmissionService },
+    { provide: ANCHOR_SUBMISSION, useFactory: (config: ConfigService, enabled: AnchorSubmissionService, disabled: DisabledAnchorSubmissionService) => config.get("ANCHOR_ENABLED") === "false" ? disabled : enabled, inject: [ConfigService, AnchorSubmissionService, DisabledAnchorSubmissionService] },
     ...(mock
       ? [{ provide: ANCHOR_DISPATCHER, useClass: ImmediateAnchorDispatcher }]
       : [BullAnchorDispatcher, AnchorProcessor, { provide: ANCHOR_DISPATCHER, useExisting: BullAnchorDispatcher }]),

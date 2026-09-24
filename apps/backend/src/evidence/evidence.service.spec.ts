@@ -55,6 +55,14 @@ describe("계산 근거 앵커", () => {
   let anchors: FakeAnchors;
   let service: TaxEvidenceService;
 
+  it("rejects disabled anchoring before storing a pending evidence record", async () => {
+    const repo = new MockTaxEvidenceRepository();
+    const disabled = { enabled: () => false, submit: async () => { throw new Error("Disabled anchoring must not submit"); } };
+    const isolated = new TaxEvidenceService(repo, disabled, anchors);
+    await expect(isolated.record(USER, body())).rejects.toMatchObject({ status: 503 });
+    expect(await repo.findLatest(USER, "KR", 2027)).toBeNull();
+  });
+
   beforeEach(() => {
     anchors = new FakeAnchors();
     service = new TaxEvidenceService(new MockTaxEvidenceRepository(), anchors, anchors);

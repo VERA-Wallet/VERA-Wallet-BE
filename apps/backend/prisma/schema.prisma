@@ -161,3 +161,22 @@ model TaxEvidence {
   @@unique([userId, merkleRoot])
   @@index([userId, countryCode, taxYear])
 }
+
+/// Short-lived browser-bound Open DID attempts. Never stores VP/claims/JWT.
+model OpenDidAttempt {
+  id          String   @id
+  offerId     String   @unique
+  secretHash  String
+  policyId    String
+  country     String
+  expiresAt   DateTime
+  status      String   @default("pending")
+  leaseToken  String?
+  leaseUntil  DateTime?
+  nextPollAt  DateTime
+  consumedAt  DateTime?
+  createdAt   DateTime @default(now())
+
+  @@index([expiresAt])
+  @@index([secretHash])
+}
